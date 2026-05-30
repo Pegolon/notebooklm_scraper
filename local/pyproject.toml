@@ -1,7 +1,7 @@
 [project]
-name = "notebooklm-scraper"
+name = "notebooklm-scraper-local"
 version = "0.1.0"
-description = "Scrape NotebookLM Audio Overviews into a Google Drive folder for podcast syndication."
+description = "Scrape NotebookLM Audio Overviews into a Google Drive folder and transcribe them with Gemini."
 requires-python = ">=3.14"
 dependencies = [
     "playwright>=1.44.0",

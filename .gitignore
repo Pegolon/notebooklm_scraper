@@ -1,9 +1,13 @@
-.env
-.venv/
-playwright_profile/
-scraper_state.json
+# env / venv / caches in any subproject
+**/.env
+**/.venv/
+**/__pycache__/
+*.pyc
 *.log
 *.err
-__pycache__/
-*.pyc
-# uv keeps its lock file checked in, so don't ignore uv.lock
+
+# local scraper runtime state
+local/playwright_profile/
+local/scraper_state.json
+
+# uv keeps its lock files checked in, so don't ignore them

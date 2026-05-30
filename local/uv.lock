@@ -301,7 +301,7 @@ wheels = [
 ]
 
 [[package]]
-name = "notebooklm-scraper"
+name = "notebooklm-scraper-local"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
