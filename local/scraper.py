@@ -17,6 +17,7 @@ INITIAL_SINCE_DATE (defaults to 2026-05-01).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -881,23 +882,30 @@ def run_scrape(url_override: Optional[str]) -> None:
         finally:
             ctx.close()
 
-    # Final pass: transcribe any MP3 (newly downloaded OR previously failed)
-    # that doesn't yet have a sidecar .vtt, using MLX Whisper locally.
-    try:
-        from transcribe import transcribe_missing
-        assert OUTPUT_DIR is not None
-        transcribe_missing(OUTPUT_DIR)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Transcription pass failed: %s", e)
+    # Run the transcription and cover-art passes concurrently. The two are
+    # fully independent (different sidecar files, different backends — MLX
+    # Whisper on-device vs. Ollama over HTTP), so we can let them overlap.
+    # Each underlying function is synchronous and blocking, so we hand them
+    # to a worker thread via asyncio.to_thread and gather the results.
+    assert OUTPUT_DIR is not None
+    asyncio.run(_run_post_passes(OUTPUT_DIR))
 
-    # Cover-art pass: for every MP3 without a sibling .png, generate one from
-    # the description in the sidecar JSON. No-ops when GEMINI_API_KEY is unset.
-    try:
-        from coverart import cover_missing
-        assert OUTPUT_DIR is not None
-        cover_missing(OUTPUT_DIR)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Cover-art pass failed: %s", e)
+
+async def _run_post_passes(output_dir: Path) -> None:
+    from transcribe import transcribe_missing
+    from coverart import cover_missing
+
+    async def _safe(name: str, fn, *args):
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s pass failed: %s", name, e)
+            return None
+
+    await asyncio.gather(
+        _safe("Transcription", transcribe_missing, output_dir),
+        _safe("Cover-art", cover_missing, output_dir),
+    )
 
 
 # ---------------------------------------------------------------------------
