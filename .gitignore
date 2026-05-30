@@ -5,6 +5,7 @@
 *.pyc
 *.log
 *.err
+.DS_Store
 
 # local scraper runtime state
 local/playwright_profile/

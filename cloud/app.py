@@ -135,6 +135,8 @@ def load_episodes(output_dir: Path) -> list[dict]:
         meta["_mtime"] = st.st_mtime
         vtt = mp3.with_suffix(".vtt")
         meta["_transcript_file"] = vtt.name if vtt.exists() else None
+        png = mp3.with_suffix(".png")
+        meta["_image_file"] = png.name if png.exists() else None
         out.append(meta)
     out.sort(key=lambda m: m.get("pub_date") or "", reverse=True)
     return out
@@ -211,6 +213,13 @@ def build_feed(episodes: list[dict], base_url: str) -> str:
             transcript.set("url", f"{base_url}/transcripts/{ep['_transcript_file']}")
             transcript.set("type", "text/vtt")
             transcript.set("lang", FEED_LANGUAGE.split("-")[0] or "en")
+
+        # Per-episode cover art (written by local/coverart.py). Falls back to
+        # the channel-level FEED_IMAGE_URL in clients that don't see an
+        # item-level <itunes:image>.
+        if ep.get("_image_file"):
+            ep_img = ET.SubElement(item, f"{{{ITUNES_NS}}}image")
+            ep_img.set("href", f"{base_url}/images/{ep['_image_file']}")
 
         ET.SubElement(item, f"{{{ITUNES_NS}}}author").text = FEED_AUTHOR
         if desc:
@@ -384,6 +393,30 @@ def serve_audio(filename: str, request: Request) -> Response:
         headers=headers,
         media_type="audio/mpeg",
     )
+
+
+@app.api_route("/images/{filename}", methods=["GET", "HEAD"])
+def serve_image(filename: str, request: Request) -> Response:
+    """Serve a PNG cover image from OUTPUT_DIR.
+
+    Used for both per-episode `<itunes:image>` (written by local/coverart.py
+    as `<hash>.png`) and the channel-level cover (e.g. `cover.png` dropped
+    into OUTPUT_DIR by hand and referenced via FEED_IMAGE_URL).
+    """
+    path = _safe_resolve(filename, ".png")
+    stat = path.stat()
+    last_modified = format_datetime(
+        datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+    )
+    etag = f'"{hashlib.md5(f"{path.name}-{stat.st_size}-{stat.st_mtime}".encode()).hexdigest()}"'
+    headers = {
+        "Content-Length": str(stat.st_size),
+        "Last-Modified": last_modified,
+        "ETag": etag,
+        "Cache-Control": "public, max-age=86400",
+    }
+    body = b"" if request.method == "HEAD" else path.read_bytes()
+    return Response(content=body, media_type="image/png", headers=headers)
 
 
 @app.api_route("/transcripts/{filename}", methods=["GET", "HEAD"])

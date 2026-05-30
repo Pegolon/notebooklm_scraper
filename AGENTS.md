@@ -50,7 +50,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 | [local/coverart.py](local/coverart.py) | Ollama (e.g. FLUX.2 Klein) → `<hash>.png`. Scans for MP3s missing `.png`. Standalone CLI + importable `cover_missing()`. |
 | [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`. |
 | [local/.env.example](local/.env.example) | Local-side config template. |
-| [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware) + `GET /transcripts/{name}`. Reads files directly from `OUTPUT_DIR`. |
+| [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware) + `GET /transcripts/{name}` + `GET /images/{name}`. Reads files directly from `OUTPUT_DIR`. |
 | [cloud/pyproject.toml](cloud/pyproject.toml) | Deps: `fastapi`, `uvicorn[standard]`, `python-dotenv`. |
 | [cloud/.env.example](cloud/.env.example) | Cloud-side config template. |
 
@@ -112,8 +112,9 @@ to the same Google-Drive-synced folder.
   app itself, no trailing slash — enclosure URLs are built as
   `${FEED_BASE_URL}/audio/<filename>.mp3`)
 - Optional: `FEED_TITLE`, `FEED_DESCRIPTION`, `FEED_AUTHOR`,
-  `FEED_OWNER_EMAIL`, `FEED_LANGUAGE`, `FEED_CATEGORY`, `FEED_IMAGE_URL`,
-  `FEED_LINK`
+  `FEED_OWNER_EMAIL`, `FEED_LANGUAGE`, `FEED_CATEGORY`, `FEED_IMAGE_URL`
+  (drop a `cover.png` into `OUTPUT_DIR` and set this to
+  `${FEED_BASE_URL}/images/cover.png`), `FEED_LINK`
 
 The cloud app assumes the `OUTPUT_DIR` folder is reachable as a regular
 filesystem path. On hosts that can't mount Google Drive directly, run the
@@ -331,18 +332,30 @@ summary, the Studio panel label set.
 - **`/transcripts/{filename}`** serves WebVTT (`.vtt`) files whole (they're
   tens-to-hundreds of KB; no Range support). Content-Type is
   `text/vtt; charset=utf-8`.
+- **`/images/{filename}`** serves `.png` cover images whole (Content-Type
+  `image/png`). Used both for per-episode `<itunes:image>` (`<hash>.png`
+  written by [local/coverart.py](local/coverart.py)) and for the
+  show-level cover referenced by `FEED_IMAGE_URL` (drop a `cover.png` into
+  `OUTPUT_DIR` and point `FEED_IMAGE_URL` at
+  `${FEED_BASE_URL}/images/cover.png`).
 - Each `/feed.xml` item with a sibling `.vtt` next to its `.mp3` gets a
   Podcasting 2.0 `<podcast:transcript url=… type="text/vtt" lang=…>` tag.
   Language is `FEED_LANGUAGE.split("-")[0]` (so `en-us` → `en`).
+- Each item with a sibling `.png` next to its `.mp3` gets an
+  `<itunes:image href=…>` tag. Apple Podcasts prefers ≥1400×1400 — the
+  512×512 default of [local/coverart.py](local/coverart.py) may be
+  silently rejected there even if Overcast/Pocket Casts show it fine.
 - **Path safety**: `_safe_resolve()` rejects names containing `/`, `\`,
   leading `.`, wrong suffix, or that fall outside `OUTPUT_DIR` after
-  `.resolve()`. Both audio and transcript routes share it.
+  `.resolve()`. All three of `/audio`, `/transcripts`, `/images` share it
+  (different `suffix` arg per call).
 - Iterates `*.mp3` (NOT `*.json`) — bare MP3s dropped into the folder are
   picked up too. Synthesised metadata uses filename + mtime; GUID is
   `md5(filename)` so reruns stay stable.
 - Enclosure URLs: `f"{FEED_BASE_URL}/audio/{audio_file}"`. Transcript URLs:
-  `f"{FEED_BASE_URL}/transcripts/{vtt_file}"`. `FEED_BASE_URL` is the
-  public URL of the FastAPI app itself.
+  `f"{FEED_BASE_URL}/transcripts/{vtt_file}"`. Image URLs:
+  `f"{FEED_BASE_URL}/images/{png_file}"`. `FEED_BASE_URL` is the public
+  URL of the FastAPI app itself.
 - All three namespaces (`itunes`, `atom`, `podcast`) are registered via
   `ET.register_namespace()` (do NOT pass `xmlns:*` manually as an
   attribute — ElementTree will emit `ns0:`/`ns1:` prefixes).
