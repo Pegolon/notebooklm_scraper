@@ -1,0 +1,13 @@
+[project]
+name = "notebooklm-scraper"
+version = "0.1.0"
+description = "Scrape NotebookLM Audio Overviews into a Google Drive folder for podcast syndication."
+requires-python = ">=3.14"
+dependencies = [
+    "playwright>=1.44.0",
+    "python-dotenv>=1.0.0",
+    "google-genai>=1.0.0",
+]
+
+[tool.uv]
+package = false
