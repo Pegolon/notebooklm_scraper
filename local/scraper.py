@@ -1019,50 +1019,47 @@ def run_scrape(url_override: Optional[str]) -> None:
                 target_url = url_override or NOTEBOOK_URL
                 log.info("URL override in use; skipping home-page listing: %s", target_url)
                 _process_notebook(page, notebook=None, url=target_url, state=state)
-                return
+            else:
+                notebooks = list_notebooks(page)
+                if not notebooks:
+                    log.info("No notebooks visible; nothing to scrape.")
+                else:
+                    # Opportunistic emoji backfill: any episode whose JSON sidecar
+                    # predates the notebook_emoji field (or that was scraped via
+                    # --url with no card to read) gets its emoji filled in now,
+                    # and the stale cover deleted so the cover-art pass below
+                    # rerenders it with the right glyph.
+                    n_back = backfill_emojis_into_json(notebooks)
+                    if n_back:
+                        log.info("Backfilled notebook_emoji into %d sidecar(s).", n_back)
 
-            notebooks = list_notebooks(page)
-            if not notebooks:
-                log.info("No notebooks visible; nothing to do.")
-                return
+                    undated = [n for n in notebooks if n["modified"] is None]
+                    if undated:
+                        log.warning(
+                            "Skipping %d notebook(s) with unparseable dates "
+                            "(re-check selectors if this is unexpected).", len(undated),
+                        )
 
-            # Opportunistic emoji backfill: any episode whose JSON sidecar
-            # predates the notebook_emoji field (or that was scraped via
-            # --url with no card to read) gets its emoji filled in now,
-            # and the stale cover deleted so the cover-art pass below
-            # rerenders it with the right glyph.
-            n_back = backfill_emojis_into_json(notebooks)
-            if n_back:
-                log.info("Backfilled notebook_emoji into %d sidecar(s).", n_back)
+                    candidates = select_candidates(notebooks, since_date, processed_ids)
+                    if not candidates:
+                        log.info("No new notebooks to process.")
+                    else:
+                        log.info("Queue: %d notebook(s) to process (oldest first):", len(candidates))
+                        for n in candidates:
+                            log.info("  - %s  %s  %s", n["modified"].date(), n["id"], n["title"])
 
-            undated = [n for n in notebooks if n["modified"] is None]
-            if undated:
-                log.warning(
-                    "Skipping %d notebook(s) with unparseable dates "
-                    "(re-check selectors if this is unexpected).", len(undated),
-                )
+                        successes, failures = 0, 0
+                        for n in candidates:
+                            log.info("=== %s — %s ===", n["modified"].date(), n["title"])
+                            try:
+                                _process_notebook(page, notebook=n, url=n["url"], state=state)
+                                successes += 1
+                            except Exception as e:  # noqa: BLE001
+                                failures += 1
+                                log.error("Failed to process %s (%s): %s", n["title"], n["id"], e)
+                                # Do NOT mark as processed — next run will retry.
 
-            candidates = select_candidates(notebooks, since_date, processed_ids)
-            if not candidates:
-                log.info("No new notebooks to process. Done.")
-                return
-
-            log.info("Queue: %d notebook(s) to process (oldest first):", len(candidates))
-            for n in candidates:
-                log.info("  - %s  %s  %s", n["modified"].date(), n["id"], n["title"])
-
-            successes, failures = 0, 0
-            for n in candidates:
-                log.info("=== %s — %s ===", n["modified"].date(), n["title"])
-                try:
-                    _process_notebook(page, notebook=n, url=n["url"], state=state)
-                    successes += 1
-                except Exception as e:  # noqa: BLE001
-                    failures += 1
-                    log.error("Failed to process %s (%s): %s", n["title"], n["id"], e)
-                    # Do NOT mark as processed — next run will retry.
-
-            log.info("Done. %d succeeded, %d failed.", successes, failures)
+                        log.info("Scrape done. %d succeeded, %d failed.", successes, failures)
         finally:
             ctx.close()
 
