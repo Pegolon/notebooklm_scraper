@@ -77,16 +77,60 @@ def _hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def convert_one(m4a: Path, *, output_dir: Path, force: bool = False) -> Optional[Path]:
-    """Convert one M4A to <hash>.mp3 in output_dir. Returns the MP3 path, or
-    None if the output already existed (and force=False). Raises on ffmpeg
-    failure."""
+def transcode_to_mp3(src: Path, dst: Path, *, quality: Optional[str] = None) -> Path:
+    """Transcode `src` (any audio container ffmpeg can read) to MP3 at `dst`.
+
+    Writes via a hidden `<dst>.partial` temp file and atomically renames on
+    success — a crash mid-encode cannot leave a half-written file at `dst`.
+    Returns `dst`. Raises RuntimeError on any ffmpeg failure.
+
+    Shared between the standalone convert pass (which names `dst` by the m4a
+    bytes hash) and the scraper (which preserves the description-based hash
+    so the JSON sidecar's `audio_file` stays valid).
+    """
     if shutil.which("ffmpeg") is None:
         raise RuntimeError(
             "ffmpeg not found on PATH. Install it (e.g. `brew install ffmpeg`) "
             "and re-run."
         )
 
+    q = (quality or MP3_QUALITY).strip()
+    tmp = dst.with_name(f".{dst.name}.partial")
+    cmd = [
+        "ffmpeg",
+        "-y",                       # overwrite tmp if it somehow exists
+        "-loglevel", "error",       # quiet output; we only care about errors
+        "-i", str(src),
+        "-vn",                      # drop any embedded artwork/video stream
+        "-c:a", "libmp3lame",
+        "-q:a", q,
+        "-f", "mp3",                # force muxer (tmp filename ends in .partial,
+                                    # which would otherwise confuse ffmpeg's
+                                    # extension-based format detection)
+        str(tmp),
+    ]
+    log.info("Transcoding %s → %s (libmp3lame VBR q=%s)...", src.name, dst.name, q)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        tmp.unlink(missing_ok=True)
+        # ffmpeg writes its real diagnostic to stderr.
+        raise RuntimeError(
+            f"ffmpeg failed on {src.name}: {(e.stderr or '').strip() or e}"
+        ) from e
+    except FileNotFoundError as e:  # noqa: BLE001 — race: PATH lost ffmpeg between which() and run()
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("ffmpeg disappeared from PATH mid-run.") from e
+
+    tmp.replace(dst)
+    return dst
+
+
+def convert_one(m4a: Path, *, output_dir: Path, force: bool = False) -> Optional[Path]:
+    """Convert one M4A to <hash>.mp3 in output_dir, where <hash> is the MD5
+    of the M4A bytes (so re-runs on the same input skip the work). Returns
+    the MP3 path, or None if the output already existed (and force=False).
+    Raises on ffmpeg failure."""
     size_mb = m4a.stat().st_size / 1024 / 1024
     log.info("Hashing %s (%.1f MB)...", m4a.name, size_mb)
     digest = _hash_file(m4a)
@@ -96,37 +140,7 @@ def convert_one(m4a: Path, *, output_dir: Path, force: bool = False) -> Optional
         log.info("%s already converted (%s); skipping.", m4a.name, mp3.name)
         return None
 
-    # Write to a temp path first then atomically rename, so a crash mid-encode
-    # can't leave a half-written <hash>.mp3 that the next idempotency check
-    # would mistake for a finished conversion.
-    tmp = output_dir / f".{digest}.mp3.partial"
-    cmd = [
-        "ffmpeg",
-        "-y",                       # overwrite tmp if it somehow exists
-        "-loglevel", "error",       # quiet output; we only care about errors
-        "-i", str(m4a),
-        "-vn",                      # drop any embedded artwork/video stream
-        "-c:a", "libmp3lame",
-        "-q:a", MP3_QUALITY,
-        "-f", "mp3",                # force muxer (tmp filename ends in .partial,
-                                    # which would otherwise confuse ffmpeg's
-                                    # extension-based format detection)
-        str(tmp),
-    ]
-    log.info("Converting %s → %s (libmp3lame VBR q=%s)...", m4a.name, mp3.name, MP3_QUALITY)
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        tmp.unlink(missing_ok=True)
-        # ffmpeg writes its real diagnostic to stderr.
-        raise RuntimeError(
-            f"ffmpeg failed on {m4a.name}: {(e.stderr or '').strip() or e}"
-        ) from e
-    except FileNotFoundError as e:  # noqa: BLE001 — race: PATH lost ffmpeg between which() and run()
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError("ffmpeg disappeared from PATH mid-run.") from e
-
-    tmp.replace(mp3)
+    transcode_to_mp3(m4a, mp3)
     out_size = mp3.stat().st_size
     log.info("Wrote %s (%.1f KB).", mp3.name, out_size / 1024)
     return mp3

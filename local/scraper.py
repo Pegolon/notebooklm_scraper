@@ -734,12 +734,49 @@ def save_episode(
         log.info("Episode already exists (%s); skipping write.", json_path.name)
         return json_path, ep_hash
 
-    download.save_as(str(mp3_path))
+    # Save the raw download to a hidden temp file first — we don't yet know
+    # whether NotebookLM delivered real MPEG audio or an MP4/DASH container,
+    # and the two need very different post-processing. Sniffing magic bytes
+    # before committing to <hash>.mp3 prevents us from saving a mislabelled
+    # ISO Media stream under a .mp3 extension (which silently breaks every
+    # downstream pass that assumes MPEG audio — id3tag in particular).
+    tmp_download = OUTPUT_DIR / f".{ep_hash}.download.partial"
+    download.save_as(str(tmp_download))
+
+    raw_size = tmp_download.stat().st_size
+    if raw_size < 10_000:
+        tmp_download.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded audio is suspiciously small ({raw_size} bytes); aborting.")
+
+    with tmp_download.open("rb") as f:
+        head = f.read(12)
+    is_mp4 = head[4:8] == b"ftyp"   # ISO Base Media (MP4, M4A, DASH segments)
+
+    if is_mp4:
+        # Hand off to the same ffmpeg helper convert.py uses. We force the
+        # output name so the description-hash naming (and the JSON sidecar
+        # that references it) stays valid.
+        log.info(
+            "NotebookLM served an MP4/ISO container; transcoding to MP3 "
+            "in-place via ffmpeg..."
+        )
+        from convert import transcode_to_mp3
+
+        try:
+            transcode_to_mp3(tmp_download, mp3_path)
+        finally:
+            tmp_download.unlink(missing_ok=True)
+    else:
+        # ID3-tagged MP3 (b"ID3...") or raw MPEG sync (b"\xff\xfb...") — keep
+        # as-is. Any unrecognised header still passes through here; the
+        # size check above ruled out tiny error pages, and downstream
+        # tools (id3tag) will surface real corruption with a clear error.
+        tmp_download.replace(mp3_path)
 
     size = mp3_path.stat().st_size
     if size < 10_000:
         mp3_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Downloaded audio is suspiciously small ({size} bytes); aborting.")
+        raise RuntimeError(f"Final audio is suspiciously small ({size} bytes); aborting.")
 
     now = datetime.now(timezone.utc)
     title_part = notebook_title.strip() or now.strftime("%Y-%m-%d")
