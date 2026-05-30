@@ -35,7 +35,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 
 - **Python 3.14** (pinned via `.python-version` in each subdir)
 - **uv** for env / deps / lockfile (`uv sync`, `uv run …`)
-- **local/**: Playwright (Chromium), mlx-whisper, google-genai (for cover art), python-dotenv
+- **local/**: Playwright (Chromium), mlx-whisper, python-dotenv; cover-art pass talks to a remote Ollama HTTP API (no Python client dep)
 - **cloud/**: FastAPI, uvicorn[standard], python-dotenv
 - Standard library `xml.etree.ElementTree` for RSS (no extra dep)
 
@@ -43,9 +43,10 @@ and `README.md`. Never merge them — they ship to different hosts.
 
 | Path | Role |
 |---|---|
-| [local/scraper.py](local/scraper.py) | Playwright scraper. Lists notebooks, picks new ones, downloads audio, writes JSON, runs transcribe pass at end. |
+| [local/scraper.py](local/scraper.py) | Playwright scraper. Lists notebooks, picks new ones, downloads audio, writes JSON, runs transcribe + cover-art passes at end. |
 | [local/transcribe.py](local/transcribe.py) | MLX Whisper → WebVTT (on-device). Scans for MP3s missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
-| [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`, `google-genai`. |
+| [local/coverart.py](local/coverart.py) | Ollama (e.g. FLUX.2 Klein) → `<hash>.png`. Scans for MP3s missing `.png`. Standalone CLI + importable `cover_missing()`. |
+| [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`. |
 | [local/.env.example](local/.env.example) | Local-side config template. |
 | [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware). |
 | [cloud/pyproject.toml](cloud/pyproject.toml) | Deps: `fastapi`, `uvicorn[standard]`, `python-dotenv`. |
@@ -64,6 +65,9 @@ uv run scraper.py --list               # debug: enumerate notebooks
 uv run scraper.py --url <URL>          # force a specific notebook
 uv run transcribe.py                   # transcribe any MP3 missing a .vtt
 uv run transcribe.py --file foo.mp3    # transcribe one file
+uv run coverart.py                     # generate cover PNGs for any MP3 missing one
+uv run coverart.py --file foo.mp3      # generate one cover
+uv run coverart.py --force             # regenerate everything
 
 # cloud side
 cd cloud
@@ -86,6 +90,11 @@ to the same Google-Drive-synced folder.
   ISO-639-1 hint; empty = auto-detect), `WHISPER_INITIAL_PROMPT` (short
   style-priming sentence; default biases toward proper punctuation +
   capitalisation). Model is fetched from HF Hub on first run and cached.
+- Cover art (Ollama, remote or local): `OLLAMA_BASE_URL` (default
+  `http://localhost:11434`), `OLLAMA_IMAGE_MODEL` (default
+  `x/flux2-klein:9b`), `COVER_WIDTH`/`COVER_HEIGHT` (default `512`),
+  `COVER_STEPS` (default `12`), `COVER_TIMEOUT_S` (default `600`),
+  `COVER_STYLE_PROMPT` (override the bundled global style guide).
 
 `cloud/.env` knobs:
 - Required: `OUTPUT_DIR`, `FEED_BASE_URL` (the public URL of the FastAPI
@@ -103,13 +112,14 @@ OUTPUT_DIR=/Users/.../My\ Drive/Podcasts        # backslash escape
 OUTPUT_DIR="/Users/.../My Drive/Podcasts"       # quoted
 ```
 `python-dotenv` reads values **literally** — it does not unescape `\ ` or
-strip quotes. Both `local/scraper.py`, `local/transcribe.py`, and
-`cloud/app.py` defensively run path values through `_clean_path_value()` to
-handle both styles. Keep this helper when adding new scripts.
+strip quotes. All four scripts (`local/scraper.py`, `local/transcribe.py`,
+`local/coverart.py`, `cloud/app.py`) defensively run path values through
+`_clean_path_value()` to handle both styles. Keep this helper when adding
+new scripts.
 
 ## Data model
 
-Each scraped episode produces two sibling files (and later a `.vtt`):
+Each scraped episode produces two sibling files (and later `.vtt` + `.png`):
 
 - **`<hash>.mp3`** — raw audio download from NotebookLM's "Audio Overview" kebab → Download.
 - **`<hash>.json`** — episode metadata:
@@ -126,6 +136,7 @@ Each scraped episode produces two sibling files (and later a `.vtt`):
   }
   ```
 - **`<hash>.vtt`** — WebVTT transcript (added by `transcribe.py`).
+- **`<hash>.png`** — cover art (added by `coverart.py`).
 
 `<hash>` = MD5 of the normalized (whitespace-collapsed, lowercased) description.
 This makes regeneration of the same content idempotent.
@@ -209,6 +220,35 @@ summary, the Studio panel label set.
   MLX deps are installed (Mac-only). On non-Mac hosts the import will fail
   per-file and be logged.
 
+## Cover-art specifics
+
+- Runs after the transcription pass in `scraper.py` (and on demand via
+  `coverart.py`). For every `<hash>.mp3` lacking a sibling `<hash>.png`,
+  read `title` + `description` from `<hash>.json`, prepend the global
+  `COVER_STYLE_PROMPT`, and send a single text prompt to Ollama's
+  `POST /api/generate` (stdlib `urllib`, no Python client dep).
+- **Stream the response** (`stream: true`). Image-gen on FLUX.2 Klein 9B
+  emits one JSONL progress line per diffusion step, then a final
+  `{"image": "<base64-png>", "done": true}` line. Streaming makes the
+  socket timeout per-chunk instead of wall-clock — `stream: false`
+  buffers the entire render server-side and reliably trips Python's
+  read timeout on a cold model load.
+- Defaults are deliberately small (512×512, 12 steps, ~2 min/cover on
+  this hardware) so the pass finishes inside `COVER_TIMEOUT_S` (default
+  600 s). Bump `COVER_WIDTH`/`COVER_HEIGHT`/`COVER_STEPS` for Apple-spec
+  1400² covers, and raise `COVER_TIMEOUT_S` accordingly.
+- Bytes are written **straight through as `.png`** — no Pillow / no
+  re-encoding. If Ollama ever returns a non-`image/png` MIME, we log a
+  warning and still write whatever bytes came back under the `.png` name.
+- Failures don't block the rest of the pass; logged and moved on. The
+  pass is also a no-op when there are no missing covers, so reruns of
+  `scraper.py` are cheap.
+- **No negative-prompt support**: Ollama's `/api/generate` schema has no
+  `negative_prompt` field, so the "no text, no logos" line in the
+  default style prompt is just a hint — FLUX will still render
+  typography. If text-free covers matter, restyle `COVER_STYLE_PROMPT`
+  to lean abstract/non-figurative rather than fighting the prior.
+
 ## Cloud app (FastAPI) specifics
 
 - **No disk writes.** The feed is built per request — there is no `feed.xml`
@@ -256,8 +296,11 @@ summary, the Studio panel label set.
 
 ```bash
 # Sanity-check Python compiles after edits
-uv --project local run python -m py_compile local/scraper.py local/transcribe.py
+uv --project local run python -m py_compile local/scraper.py local/transcribe.py local/coverart.py
 uv --project cloud run python -m py_compile cloud/app.py
+
+# Confirm the Ollama host is reachable and the image model is installed
+curl -fsS "$OLLAMA_BASE_URL/api/tags" | python3 -c "import sys,json; print([m['name'] for m in json.load(sys.stdin).get('models',[])])"
 
 # Dump notebooks the scraper currently sees
 ( cd local && uv run scraper.py --list )
@@ -282,8 +325,8 @@ for f in pathlib.Path(os.environ['OUTPUT_DIR']).glob('*.json'):
 - Single-purpose modules. Don't merge them unless asked.
 - Each top-level script has a docstring with `uv run …` invocation examples.
 - Logging via stdlib `logging` with the same format string everywhere.
-- Defensive `try/except` is fine around external IO (Playwright, Gemini,
-  file streaming), but log loudly — never swallow silently.
+- Defensive `try/except` is fine around external IO (Playwright, MLX
+  Whisper, Ollama, file streaming), but log loudly — never swallow silently.
 - Selector logic in `scraper.py` is the volatile part. Comment WHY a
   selector exists when you add one.
 

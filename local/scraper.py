@@ -890,6 +890,15 @@ def run_scrape(url_override: Optional[str]) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("Transcription pass failed: %s", e)
 
+    # Cover-art pass: for every MP3 without a sibling .png, generate one from
+    # the description in the sidecar JSON. No-ops when GEMINI_API_KEY is unset.
+    try:
+        from coverart import cover_missing
+        assert OUTPUT_DIR is not None
+        cover_missing(OUTPUT_DIR)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Cover-art pass failed: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Entry point

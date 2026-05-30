@@ -3,8 +3,9 @@
 Two-part system that turns Google NotebookLM "Audio Overviews" into a
 personal podcast RSS feed with transcripts:
 
-- [**local/**](local/) — Mac Mini side. Playwright scraper + Gemini
-  transcriber. Writes `<hash>.mp3` / `.json` / `.vtt` triplets into a
+- [**local/**](local/) — Mac Mini side. Playwright scraper, on-device
+  MLX-Whisper transcriber, and Ollama-driven cover-art generator. Writes
+  `<hash>.mp3` / `.json` / `.vtt` / `.png` quartets into a
   Google-Drive-synced folder (`OUTPUT_DIR`).
 - [**cloud/**](cloud/) — Wherever you can publish. FastAPI app that reads
   the same folder (synced down to the cloud box via Google Drive), generates
@@ -18,14 +19,16 @@ personal podcast RSS feed with transcripts:
 │   → MP3 + JSON sidecar         │      │   GET /feed.xml         →  RSS XML     │
 │ local/transcribe.py            │      │   GET /audio/<n>        →  MP3 (Range) │
 │   → <name>.vtt                 │      │   GET /transcripts/<n>  →  WebVTT      │
-│                                │      ╰──────────────┬─────────────────────────╯
+│ local/coverart.py              │      ╰──────────────┬─────────────────────────╯
+│   → <name>.png                 │                     │
 ╰──────────┬─────────────────────╯                     │ reads
            ▼ writes into                               │
     ╭────────────────────────────╮  ◀─── same folder ──╯
     │ OUTPUT_DIR (Google Drive)  │
     │   ↳ <hash>.mp3             │
     │   ↳ <hash>.json            │
-    │   ↳ <hash>.vtt             │   (manual MP3 drops also work)
+    │   ↳ <hash>.vtt             │
+    │   ↳ <hash>.png             │   (manual MP3 drops also work)
     ╰────────────────────────────╯
 ```
 
@@ -47,7 +50,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 cd local
 uv sync
 uv run playwright install chromium
-cp .env.example .env                   # set OUTPUT_DIR (+ optional GEMINI_API_KEY)
+cp .env.example .env                   # set OUTPUT_DIR (+ optional OLLAMA_BASE_URL for cover art)
 uv run scraper.py --login              # one-time Google sign-in (headful)
 uv run scraper.py                      # main entry point
 ```
@@ -71,16 +74,17 @@ notes.
 
 Both halves need their own `.env` files, but the only setting that must
 agree between them is **`OUTPUT_DIR`** — both must resolve to the same
-synced Google Drive folder. Everything else (Gemini key on local, RSS
-metadata on cloud) is one-sided.
+synced Google Drive folder. Everything else (Whisper / Ollama settings on
+local, RSS metadata on cloud) is one-sided.
 
 ## Data model
 
-Each scraped episode produces a triplet alongside in `OUTPUT_DIR`:
+Each scraped episode produces this set of sibling files in `OUTPUT_DIR`:
 
 - **`<hash>.mp3`** — the Audio Overview download.
 - **`<hash>.json`** — metadata: title, description, pub_date, source notebook id/URL.
 - **`<hash>.vtt`** — WebVTT transcript (added by the transcribe pass).
+- **`<hash>.png`** — cover art themed by the description (added by the cover-art pass).
 
 `<hash>` is `md5(normalized_description)` so regeneration of the same
 NotebookLM content is idempotent.
