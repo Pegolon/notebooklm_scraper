@@ -12,3 +12,4 @@ local/playwright_profile/
 local/scraper_state.json
 
 # uv keeps its lock files checked in, so don't ignore them
+.playwright-mcp/page-*.yml

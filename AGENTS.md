@@ -456,8 +456,123 @@ for f in pathlib.Path(os.environ['OUTPUT_DIR']).glob('*.json'):
 2. If it returns 0 notebooks, `debug_home.html` will be written — inspect.
 3. If listing works but a specific notebook fails, try
    `uv run scraper.py --url <URL>` and look at which extraction step blew up.
-4. For description/title regressions, ask the user for a screenshot of the
-   chat panel — guessing at selectors blind has burned cycles before.
+4. For description/title regressions, **don't guess selectors blind** — drive
+   the user's signed-in Chrome session via the Playwright MCP server (recipe
+   below). Falling back to "ask for a screenshot" is a distant second.
+
+### Debugging NotebookLM's live DOM via Playwright MCP
+
+When a selector regresses, the fastest path is to attach to the user's
+signed-in Chrome via CDP and probe the live DOM. Playwright MCP gives the
+agent first-class tools (`browser_navigate`, `browser_snapshot`,
+`browser_evaluate`, `browser_click`, etc.) that work against the same
+session the user sees in their Chrome window. This is how we diagnosed the
+May 2026 `<h1>` → `<h2 class="cover-title">` regression and the
+artifact-library-item rewrite of the audio overview row.
+
+**One-time setup.** Add the Playwright MCP server to Amp's settings
+(`~/.config/amp/settings.json` on macOS):
+
+```json
+{
+  "amp.mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest", "--cdp-endpoint", "http://127.0.0.1:9222"]
+    }
+  }
+}
+```
+
+Restart Amp so it launches the server.
+
+**Each debugging session.** The user must run a Chrome instance with the
+remote-debugging port open. Since Chrome 136, the port is silently disabled
+whenever `--user-data-dir` points at the **default** profile
+(`~/Library/Application Support/Google/Chrome` on macOS) — this is an
+intentional hardening to prevent cookie/token theft. The workaround is a
+dedicated debug profile:
+
+```bash
+# one-time
+mkdir -p ~/chrome-debug-profile
+
+# every session: fully quit Chrome first, then:
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/chrome-debug-profile"
+```
+
+The user signs into Google once in that window; the profile persists across
+sessions. To verify the port is live before involving the MCP server:
+
+```bash
+curl -s http://127.0.0.1:9222/json/version | head -3
+# should print {"Browser": "Chrome/...", "Protocol-Version": "1.3", ...
+```
+
+If `curl` returns nothing, Chrome silently refused to enable the port —
+almost always because the default profile was used. Quit and relaunch with
+the dedicated `--user-data-dir`.
+
+**Once connected**, the agent can:
+
+- `mcp__playwright__browser_navigate` to a notebook URL.
+- `mcp__playwright__browser_snapshot` to get an accessibility tree (better
+  than raw HTML for orientation).
+- `mcp__playwright__browser_evaluate` to run JS against the live page,
+  e.g. enumerate all `<h1>`/`<h2>`, walk an ancestor chain, list menu items
+  after clicking a kebab — same techniques the scraper uses, but
+  interactive.
+- `mcp__playwright__browser_click` + `browser_press_key` (`Escape` to close
+  popovers) to drive interactive flows like opening kebab menus.
+
+**Useful evaluate recipes** (paste-ready, copy-adapt as needed):
+
+```js
+// Enumerate all headings (catches <h1> → <h2> regressions)
+() => ({
+  h1: Array.from(document.querySelectorAll('h1')).map(h => ({text: h.innerText.slice(0,120), cls: h.className})),
+  h2: Array.from(document.querySelectorAll('h2')).map(h => ({text: h.innerText.slice(0,120), cls: h.className})),
+})
+
+// Walk the ancestor chain from a known anchor up to <body>, with
+// text-length samples — mirrors _DESCRIPTION_JS so you can see exactly
+// where the walk-up should stop.
+() => {
+  const anchor = document.querySelector('h2.cover-title');
+  if (!anchor) return null;
+  const trail = [];
+  let el = anchor.parentElement;
+  while (el && el !== document.body && trail.length < 12) {
+    const t = (el.innerText || '').trim();
+    trail.push({tag: el.tagName.toLowerCase(), cls: el.className.slice(0,60), len: t.length});
+    el = el.parentElement;
+  }
+  return trail;
+}
+
+// Inspect a kebab popover (after browser_click on the kebab button).
+// "save_alt Download" etc. — note the icon-ligature prefix on textContent.
+() => Array.from(document.querySelectorAll('[role="menuitem"]')).map(el => ({
+  text: el.textContent.trim().slice(0,80),
+  role: el.getAttribute('role'),
+}))
+```
+
+**Cleanup.** Tell the user to quit the debug Chrome window when done — a
+listening DevTools port on localhost is a small but real attack surface.
+
+**Don't** try to attach to the user's *real* Chrome profile. Chrome's
+remote-debugging hardening will refuse it (silently, with an empty port),
+and even if it didn't, sharing the profile would race against the live
+browser. The dedicated `~/chrome-debug-profile` is the only sane path.
+
+**Don't** confuse this MCP-driven debug session with the scraper's own
+Playwright profile in `local/playwright_profile/`. They are completely
+separate browsers — the MCP one is for *interactive DOM exploration* and
+the scraper one is for *automated headless runs*. The scraper does not
+need the debug port and shouldn't be pointed at it.
 
 ## What not to do
 

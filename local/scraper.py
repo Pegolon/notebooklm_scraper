@@ -619,14 +619,23 @@ def open_notebook(page: Page, url: str) -> None:
         raise RuntimeError("Not authenticated. Run `uv run scraper.py --login` first.")
 
 
-# JS scanner: anchor on the notebook's <h1> in the chat panel, then walk up to
-# the smallest ancestor that contains enough text to be the summary container.
-# Capped at ~8000 chars so we never accidentally grab the entire page body.
+# JS scanner: anchor on the notebook's title heading in the chat panel, then
+# walk up to the smallest ancestor that contains enough text to be the summary
+# container. Capped at ~8000 chars so we never accidentally grab the entire
+# page body.
+#
+# Anchor selectors, in order of preference:
+#   1. h2.cover-title — current UI (rolled out ~May 2026); the notebook title
+#      is rendered as <h2 class="cover-title mat-headline-medium"> inside
+#      <chat-panel-header>.
+#   2. h1 — legacy layout, kept as a fallback in case Google A/B-tests this.
 _DESCRIPTION_JS = r"""
 () => {
-  const h1 = document.querySelector('h1');
-  if (!h1) return null;
-  let el = h1.parentElement;
+  const anchor =
+    document.querySelector('h2.cover-title') ||
+    document.querySelector('h1');
+  if (!anchor) return null;
+  let el = anchor.parentElement;
   let best = null;
   while (el && el !== document.body) {
     const text = (el.innerText || '').trim();
@@ -708,16 +717,22 @@ def extract_description(page: Page) -> str:
 
 
 def extract_notebook_title(page: Page) -> str:
-    """Read the notebook's real title from the page (preferring <h1>, falling
-    back to the browser <title>)."""
-    try:
-        h1 = page.locator("h1").first
-        if h1.count() > 0:
-            txt = (h1.inner_text(timeout=2_000) or "").strip()
-            if len(txt) >= 3:
-                return txt
-    except Exception:
-        pass
+    """Read the notebook's real title from the page.
+
+    Tries (in order):
+      1. ``h2.cover-title`` — current UI (~May 2026), inside ``<chat-panel-header>``.
+      2. ``h1`` — legacy layout, kept as a fallback in case Google A/B-tests this.
+      3. The browser ``<title>``, with ``" - NotebookLM"`` suffix trimmed.
+    """
+    for selector in ("h2.cover-title", "h1"):
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0:
+                txt = (loc.inner_text(timeout=2_000) or "").strip()
+                if len(txt) >= 3:
+                    return txt
+        except Exception:
+            continue
     raw = (page.title() or "").strip()
     return re.sub(r"\s*[\-—–|]\s*NotebookLM.*$", "", raw, flags=re.I).strip()
 
@@ -725,11 +740,29 @@ def extract_notebook_title(page: Page) -> str:
 def _find_audio_overview_row(page: Page) -> Locator:
     """Locate the generated audio overview row in the Studio panel.
 
-    The row carries a 'Deep Dive · N sources · …' subtitle and three action
-    buttons (interactive mode, play, kebab). Strategy: find the text node,
-    walk up to the smallest ancestor that contains ≥2 buttons.
+    The row carries a 'Deep Dive · N sources · …' subtitle and four action
+    buttons (artifact-stretched body button, Interactive mode, Play, kebab).
+    Strategies, tried in order:
+
+      1. ``<artifact-library-item>`` — current UI (~May 2026). The Studio
+         panel's generated-overview row is a custom element with exactly
+         this tag, regardless of label text.
+      2. Text-anchored: find an element whose text matches
+         ``Deep Dive · …`` (the artifact subtitle uses a bullet separator)
+         and walk up to the smallest ancestor with ≥2 buttons. Used as a
+         fallback for older / A/B-tested layouts.
+
+    The bullet-separator filter on (2) is important: notebooks routinely
+    contain *sources* titled ``Deep Dive: <topic>``, and an unqualified
+    ``Deep Dive`` regex grabs the wrong row (the source's kebab opens a
+    Rename/Remove menu with no Download item).
     """
-    for needle in (r"Deep Dive", r"Audio Overview"):
+    item = page.locator("artifact-library-item").first
+    if item.count() > 0:
+        log.info("Audio overview row anchored on <artifact-library-item>.")
+        return item
+
+    for needle in (r"Deep Dive\s*[·•]", r"Audio Overview\s*[·•]"):
         text = page.get_by_text(re.compile(needle, re.I)).first
         if text.count() == 0:
             continue
@@ -737,6 +770,7 @@ def _find_audio_overview_row(page: Page) -> Locator:
         if row.count() > 0:
             log.info("Audio overview row anchored on %r.", needle)
             return row.first
+
     raise RuntimeError(
         "Could not locate the generated audio overview row. "
         "Has the overview been generated for this notebook yet?"
@@ -763,8 +797,12 @@ def download_audio_overview(page: Page) -> Download:
     kebab.click(timeout=5_000)
     page.wait_for_timeout(300)  # let the popover render
 
-    # Click the 'Download' menu item.
-    download_item = page.get_by_role("menuitem", name=re.compile(r"^\s*download\s*$", re.I)).first
+    # Click the 'Download' menu item. Note: the visible text often includes a
+    # leading Material Symbols ligature (e.g. "save_alt Download"), so we
+    # match by substring rather than exact equality.
+    download_item = page.get_by_role(
+        "menuitem", name=re.compile(r"\bdownload\b", re.I)
+    ).first
     if download_item.count() == 0:
         # MDC sometimes uses button instead of menuitem.
         download_item = page.locator(
