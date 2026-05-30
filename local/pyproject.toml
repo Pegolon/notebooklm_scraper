@@ -1,12 +1,13 @@
 [project]
 name = "notebooklm-scraper-local"
 version = "0.1.0"
-description = "Scrape NotebookLM Audio Overviews into a Google Drive folder and transcribe them with Gemini."
+description = "Scrape NotebookLM Audio Overviews into a Google Drive folder and transcribe them locally with MLX Whisper."
 requires-python = ">=3.14"
 dependencies = [
     "playwright>=1.44.0",
     "python-dotenv>=1.0.0",
     "google-genai>=1.0.0",
+    "mlx-whisper>=0.4.0",
 ]
 
 [tool.uv]

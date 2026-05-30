@@ -2,12 +2,12 @@
 
 Runs on the Mac Mini (or wherever you have a logged-in browser). Downloads new
 Audio Overviews from NotebookLM into the Google-Drive-synced `OUTPUT_DIR` and
-transcribes them via Gemini.
+transcribes them locally via MLX Whisper.
 
 ```bash
 uv sync                                # install deps into .venv
 uv run playwright install chromium     # one-time browser install
-cp .env.example .env                   # then edit OUTPUT_DIR (+ optional GEMINI_API_KEY)
+cp .env.example .env                   # then edit OUTPUT_DIR (model defaults are fine)
 uv run scraper.py --login              # one-time, headful, sign into Google
 uv run scraper.py                      # main entry point (cron / launchd)
 uv run scraper.py --list               # debug: list visible notebooks

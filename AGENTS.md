@@ -35,7 +35,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 
 - **Python 3.14** (pinned via `.python-version` in each subdir)
 - **uv** for env / deps / lockfile (`uv sync`, `uv run …`)
-- **local/**: Playwright (Chromium), google-genai, python-dotenv
+- **local/**: Playwright (Chromium), mlx-whisper, google-genai (for cover art), python-dotenv
 - **cloud/**: FastAPI, uvicorn[standard], python-dotenv
 - Standard library `xml.etree.ElementTree` for RSS (no extra dep)
 
@@ -44,8 +44,8 @@ and `README.md`. Never merge them — they ship to different hosts.
 | Path | Role |
 |---|---|
 | [local/scraper.py](local/scraper.py) | Playwright scraper. Lists notebooks, picks new ones, downloads audio, writes JSON, runs transcribe pass at end. |
-| [local/transcribe.py](local/transcribe.py) | Gemini → WebVTT. Scans for MP3s missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
-| [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `google-genai`. |
+| [local/transcribe.py](local/transcribe.py) | MLX Whisper → WebVTT (on-device). Scans for MP3s missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
+| [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`, `google-genai`. |
 | [local/.env.example](local/.env.example) | Local-side config template. |
 | [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware). |
 | [cloud/pyproject.toml](cloud/pyproject.toml) | Deps: `fastapi`, `uvicorn[standard]`, `python-dotenv`. |
@@ -81,8 +81,11 @@ to the same Google-Drive-synced folder.
 - Required: `OUTPUT_DIR`
 - Scraper: `INITIAL_SINCE_DATE` (default `2026-05-01`), `NOTEBOOK_URL`
   (override), `USER_DATA_DIR`, `TITLE_PREFIX`, `EXTRA_SETTLE_MS`
-- Transcription: `GEMINI_API_KEY` (enables the pass), `GEMINI_MODEL`
-  (default `gemini-2.5-flash`)
+- Transcription (MLX Whisper, on-device): `WHISPER_MODEL` (default
+  `mlx-community/whisper-large-v3-mlx`), `WHISPER_LANGUAGE` (optional
+  ISO-639-1 hint; empty = auto-detect), `WHISPER_INITIAL_PROMPT` (short
+  style-priming sentence; default biases toward proper punctuation +
+  capitalisation). Model is fetched from HF Hub on first run and cached.
 
 `cloud/.env` knobs:
 - Required: `OUTPUT_DIR`, `FEED_BASE_URL` (the public URL of the FastAPI
@@ -185,13 +188,26 @@ summary, the Studio panel label set.
 
 ## Transcription specifics
 
-- Uses Gemini File API: upload MP3, ask for verbatim WebVTT, delete file.
-- Default model: `gemini-2.5-flash`. ~2 minutes per ~100 MB file.
-- Output is sometimes wrapped in ```vtt fences — `_strip_code_fence()` handles
-  that. If `WEBVTT` header is missing, we prepend it.
+- Runs on-device via `mlx_whisper.transcribe(...)` (Apple-Silicon MLX backend).
+  No network call per file once the model is cached.
+- Default model: `mlx-community/whisper-large-v3-mlx`. Override with
+  `WHISPER_MODEL` (any HF repo from `mlx-community/whisper-*` or a local path).
+- We build the WebVTT ourselves from the returned `segments` list
+  (`_segments_to_vtt()` in `transcribe.py`) — timestamps are formatted as
+  `HH:MM:SS.mmm`. Empty-text segments are dropped.
+- `WHISPER_LANGUAGE` (ISO-639-1) can force a language; otherwise Whisper
+  auto-detects.
+- We pass `condition_on_previous_text=True` plus a short, *non-imperative*
+  `initial_prompt` (`WHISPER_INITIAL_PROMPT`) so Whisper carries punctuation
+  and capitalisation style across windows. Important: imperative priming
+  text ("Welcome to the show. Let's get started.") makes the model
+  *continue the prompt* on short/quiet windows instead of transcribing —
+  keep the default ("The following is a clear, well-punctuated transcript
+  …") or any descriptive variant.
 - Failures don't block the rest of the pass; logged and moved on.
-- Skips entirely when `GEMINI_API_KEY` is empty (so cron jobs without a key
-  just no-op).
+- The pass always runs; the only requirement is that `mlx-whisper` and its
+  MLX deps are installed (Mac-only). On non-Mac hosts the import will fail
+  per-file and be logged.
 
 ## Cloud app (FastAPI) specifics
 

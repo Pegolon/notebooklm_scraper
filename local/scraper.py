@@ -882,7 +882,7 @@ def run_scrape(url_override: Optional[str]) -> None:
             ctx.close()
 
     # Final pass: transcribe any MP3 (newly downloaded OR previously failed)
-    # that doesn't yet have a sidecar .vtt. No-ops when GEMINI_API_KEY is unset.
+    # that doesn't yet have a sidecar .vtt, using MLX Whisper locally.
     try:
         from transcribe import transcribe_missing
         assert OUTPUT_DIR is not None
