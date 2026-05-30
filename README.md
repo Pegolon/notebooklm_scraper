@@ -26,7 +26,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Then, from this project directory:
 
 ```bash
-cd /Users/mk/Documents/notebooklm_scraper
+cd ~/Documents/notebooklm_scraper
 
 # uv reads .python-version and pyproject.toml, downloads Python 3.14 if needed,
 # creates .venv/, and installs locked deps.
@@ -151,6 +151,10 @@ Point your podcast client at `<FEED_BASE_URL>/feed.xml`.
 
 `~/Library/LaunchAgents/com.you.notebooklm.scraper.plist`:
 
+> **Note**: launchd does **not** expand `~` or `$HOME` inside `<string>`
+> values — every path must be absolute. Replace `USERNAME` below with the
+> output of `whoami`, and check `which uv` for the correct binary path.
+
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -159,17 +163,16 @@ Point your podcast client at `<FEED_BASE_URL>/feed.xml`.
   <key>Label</key><string>com.you.notebooklm.scraper</string>
   <key>ProgramArguments</key>
   <array>
-    <!-- absolute path to uv; check `which uv` -->
-    <string>/Users/mk/.local/bin/uv</string>
+    <string>/Users/USERNAME/.local/bin/uv</string>
     <string>run</string>
     <string>--project</string>
-    <string>/Users/mk/Documents/notebooklm_scraper</string>
+    <string>/Users/USERNAME/Documents/notebooklm_scraper</string>
     <string>scraper.py</string>
   </array>
-  <key>WorkingDirectory</key><string>/Users/mk/Documents/notebooklm_scraper</string>
+  <key>WorkingDirectory</key><string>/Users/USERNAME/Documents/notebooklm_scraper</string>
   <key>StartInterval</key><integer>1800</integer>
-  <key>StandardOutPath</key><string>/Users/mk/Documents/notebooklm_scraper/scraper.log</string>
-  <key>StandardErrorPath</key><string>/Users/mk/Documents/notebooklm_scraper/scraper.err</string>
+  <key>StandardOutPath</key><string>/Users/USERNAME/Documents/notebooklm_scraper/scraper.log</string>
+  <key>StandardErrorPath</key><string>/Users/USERNAME/Documents/notebooklm_scraper/scraper.err</string>
 </dict>
 </plist>
 ```
