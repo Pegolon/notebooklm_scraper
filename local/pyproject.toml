@@ -9,6 +9,7 @@ dependencies = [
     "google-genai>=1.0.0",
     "mlx-whisper>=0.4.0",
     "mutagen>=1.47.0",
+    "pillow>=10.0.0",
 ]
 
 [tool.uv]

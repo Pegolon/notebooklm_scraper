@@ -35,7 +35,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 
 - **Python 3.14** (pinned via `.python-version` in each subdir)
 - **uv** for env / deps / lockfile (`uv sync`, `uv run …`)
-- **local/**: Playwright (Chromium), mlx-whisper, python-dotenv; cover-art and summarisation passes talk to a remote Ollama HTTP API (no Python client dep); M4A conversion shells out to `ffmpeg` (system binary on PATH)
+- **local/**: Playwright (Chromium), mlx-whisper, Pillow, python-dotenv; the summarisation pass talks to a remote Ollama HTTP API (no Python client dep); M4A conversion shells out to `ffmpeg` (system binary on PATH); cover-art is pure-Python (Pillow + Apple Color Emoji), no AI / no network
 - **cloud/**: FastAPI, uvicorn[standard], python-dotenv
 - Standard library `xml.etree.ElementTree` for RSS (no extra dep)
 
@@ -46,9 +46,9 @@ and `README.md`. Never merge them — they ship to different hosts.
 | [local/scraper.py](local/scraper.py) | Playwright scraper. Lists notebooks, picks new ones, downloads audio, writes JSON, runs convert → transcribe → summarise → cover-art passes at end (sequential — order matters for manually-dropped audio). |
 | [local/convert.py](local/convert.py) | ffmpeg M4A → `<md5(m4a-bytes)>.mp3`. Scans for `.m4a` files; idempotent (hash-based output filename, skips if `<hash>.mp3` already exists). Standalone CLI + importable `convert_missing()`. |
 | [local/transcribe.py](local/transcribe.py) | MLX Whisper → WebVTT (on-device). Scans for MP3s missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
-| [local/summarize.py](local/summarize.py) | Ollama text model → `<basename>.json`. Scans for MP3s missing `.json` but having `.vtt`; strips VTT cue headers, asks Ollama (JSON mode) for `{title, description}`, writes a sidecar mirroring scraper.py's shape (`source: "manual"`). Standalone CLI + importable `summarise_missing()`. |
-| [local/coverart.py](local/coverart.py) | Ollama (e.g. FLUX.2 Klein) → `<hash>.png`. Scans for MP3s missing `.png`. Standalone CLI + importable `cover_missing()`. |
-| [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`. |
+| [local/summarize.py](local/summarize.py) | Ollama text model → `<basename>.json`. Scans for MP3s missing `.json` but having `.vtt`; strips VTT cue headers, asks Ollama (JSON mode) for `{title, description, emoji}`, validates the emoji (rejects shortcodes / words via `_extract_emoji()`), writes a sidecar mirroring scraper.py's shape (`source: "manual"`, `notebook_emoji` populated from the LLM). Also exposes `--backfill-emojis` (cheap emoji-only LLM call for existing manual sidecars). Standalone CLI + importable `summarise_missing()` / `backfill_emojis()`. |
+| [local/coverart.py](local/coverart.py) | Pillow → `<hash>.png` (1400×1400). Reads the `notebook_emoji` field scraper.py captured from NotebookLM's auto-assigned icon and renders it full-bleed on a per-episode gradient circle. No AI, no network. Scans for MP3s missing `.png`. Standalone CLI + importable `cover_missing()`. |
+| [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`, `pillow`, `mutagen`, `google-genai`. |
 | [local/.env.example](local/.env.example) | Local-side config template. |
 | [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware) + `GET /transcripts/{name}` + `GET /images/{name}`. Reads files directly from `OUTPUT_DIR`. |
 | [cloud/pyproject.toml](cloud/pyproject.toml) | Deps: `fastapi`, `uvicorn[standard]`, `python-dotenv`. |
@@ -65,12 +65,14 @@ uv run scraper.py --login              # one-time headful Google sign-in
 uv run scraper.py                      # main entry (cron-driven)
 uv run scraper.py --list               # debug: enumerate notebooks
 uv run scraper.py --url <URL>          # force a specific notebook
+uv run scraper.py --backfill-emojis    # fill notebook_emoji into legacy JSONs, rerender covers
 uv run convert.py                      # transcode any .m4a files to <hash>.mp3
 uv run convert.py --file foo.m4a       # convert one file
 uv run transcribe.py                   # transcribe any MP3 missing a .vtt
 uv run transcribe.py --file foo.mp3    # transcribe one file
 uv run summarize.py                    # generate JSON sidecars for manual MP3s (needs .vtt)
 uv run summarize.py --file foo.mp3     # summarise one file
+uv run summarize.py --backfill-emojis  # ask LLM for an emoji for existing sidecars missing one
 uv run coverart.py                     # generate cover PNGs for any MP3 missing one
 uv run coverart.py --file foo.mp3      # generate one cover
 uv run coverart.py --force             # regenerate everything
@@ -96,11 +98,10 @@ to the same Google-Drive-synced folder.
   ISO-639-1 hint; empty = auto-detect), `WHISPER_INITIAL_PROMPT` (short
   style-priming sentence; default biases toward proper punctuation +
   capitalisation). Model is fetched from HF Hub on first run and cached.
-- Cover art (Ollama, remote or local): `OLLAMA_BASE_URL` (default
-  `http://localhost:11434`), `OLLAMA_IMAGE_MODEL` (default
-  `x/flux2-klein:9b`), `COVER_WIDTH`/`COVER_HEIGHT` (default `512`),
-  `COVER_STEPS` (default `12`), `COVER_TIMEOUT_S` (default `600`),
-  `COVER_STYLE_PROMPT` (override the bundled global style guide).
+- Cover art (Pillow, on-device, no network): `COVER_SIZE` (default
+  `1400`), `COVER_DEFAULT_EMOJI` (default `🎙️` — used when the sidecar
+  JSON has no `notebook_emoji`), `APPLE_EMOJI_FONT` (default
+  `/System/Library/Fonts/Apple Color Emoji.ttc`).
 - Summarisation of manual MP3s (Ollama, same host): `OLLAMA_TEXT_MODEL`
   (default `charaf/qwen3.6-35b-a3b-coding-nvfp4-mlx:latest`),
   `SUMMARY_TIMEOUT_S` (default `600`). `TITLE_PREFIX` is reused to keep
@@ -149,9 +150,21 @@ Each scraped episode produces two sibling files (and later `.vtt` + `.png`):
     "pub_date": "<ISO-8601 UTC>",
     "notebook_id": "<UUID from URL>",
     "notebook_url": "https://notebooklm.google.com/notebook/<UUID>",
+    "notebook_emoji": "<single emoji glyph or null>",
     "notebook_modified": "<ISO-8601 UTC>"
   }
   ```
+  `notebook_emoji` is whatever icon NotebookLM auto-assigned to the
+  notebook (captured by `parse_card_emoji()` from the home-page card).
+  Default scrape runs populate it for every new episode and also run
+  `backfill_emojis_into_json()` opportunistically — any pre-existing
+  sidecar whose `notebook_id` matches a currently-visible notebook gets
+  its emoji filled in (and its now-stale cover PNG deleted so the
+  cover-art pass rerenders it). `--url` overrides without a card to
+  read from leave it null; coverart.py falls back to
+  `COVER_DEFAULT_EMOJI` for those. Use
+  `uv run scraper.py --backfill-emojis` to run the backfill + cover
+  rerender + id3 retag without scraping any new episodes.
 - **`<hash>.vtt`** — WebVTT transcript (added by `transcribe.py`).
 - **`<hash>.png`** — cover art (added by `coverart.py`).
 
@@ -280,8 +293,14 @@ summary, the Studio panel label set.
   `POST /api/generate` with `format: "json"` and a low temperature (0.3).
   We **do not stream** the response (it's a single text completion, not
   long-running like image gen). The model returns a JSON object with
-  `title` and `description`; both are validated to be non-empty before
-  we write the sidecar.
+  `title`, `description`, and `emoji`; the first two are validated to
+  be non-empty before we write the sidecar. The `emoji` field is passed
+  through `_extract_emoji()` which accepts a single emoji cluster
+  (including ZWJ sequences like 🏃‍♂️, flag pairs like 🇪🇺, and
+  variation-selected glyphs like 🎙️) but rejects anything that's
+  plainly text (`"microphone"`, `":mic:"`, `"🎙️ — microphone"`). A
+  rejected or absent emoji is stored as `null`; coverart.py then falls
+  back to `COVER_DEFAULT_EMOJI` for that episode.
 - The written JSON mirrors `save_episode()`'s shape: `id`, `title`,
   `description`, `audio_file`, `pub_date`, plus null `notebook_*` fields
   and `"source": "manual"` so it's easy to spot manual entries. `id` is
@@ -292,35 +311,51 @@ summary, the Studio panel label set.
 - Title is formatted as `"<TITLE_PREFIX> - <topic>"` to match the rest of
   the feed; if the model already prepended the prefix we strip it before
   prepending again.
+- `summarize.py --backfill-emojis` walks any existing sidecar whose
+  `notebook_emoji` is missing/empty and asks the LLM for *only* an
+  emoji (using a tiny prompt, leaving title/description untouched),
+  then triggers cover rerender + ID3 retag — symmetric with
+  `scraper.py --backfill-emojis`. Use this after upgrading from a
+  summarize.py that pre-dates the LLM emoji field.
 
 ## Cover-art specifics
 
-- Runs after the transcription pass in `scraper.py` (and on demand via
+- Runs after the summary pass in `scraper.py` (and on demand via
   `coverart.py`). For every `<hash>.mp3` lacking a sibling `<hash>.png`,
-  read `title` + `description` from `<hash>.json`, prepend the global
-  `COVER_STYLE_PROMPT`, and send a single text prompt to Ollama's
-  `POST /api/generate` (stdlib `urllib`, no Python client dep).
-- **Stream the response** (`stream: true`). Image-gen on FLUX.2 Klein 9B
-  emits one JSONL progress line per diffusion step, then a final
-  `{"image": "<base64-png>", "done": true}` line. Streaming makes the
-  socket timeout per-chunk instead of wall-clock — `stream: false`
-  buffers the entire render server-side and reliably trips Python's
-  read timeout on a cold model load.
-- Defaults are deliberately small (512×512, 12 steps, ~2 min/cover on
-  this hardware) so the pass finishes inside `COVER_TIMEOUT_S` (default
-  600 s). Bump `COVER_WIDTH`/`COVER_HEIGHT`/`COVER_STEPS` for Apple-spec
-  1400² covers, and raise `COVER_TIMEOUT_S` accordingly.
-- Bytes are written **straight through as `.png`** — no Pillow / no
-  re-encoding. If Ollama ever returns a non-`image/png` MIME, we log a
-  warning and still write whatever bytes came back under the `.png` name.
+  read `notebook_emoji` + `title` from `<hash>.json` and render a
+  `COVER_SIZE`×`COVER_SIZE` PNG (default 1400²) showing that emoji
+  full-bleed on a per-episode gradient circle. Everything happens in
+  one Pillow process — no AI, no Ollama, no network.
+- **Emoji rendering uses Pillow with `embedded_color=True`** so we get
+  the actual colour bitmaps from Apple Color Emoji's `sbix` tables.
+  ImageMagick + FreeType on macOS **cannot** decode sbix and produces
+  black silhouettes; same goes for `rsvg-convert` via the SVG delegate.
+  Don't try to swap this for an ImageMagick pipeline unless the user
+  has installed a COLR/CPAL emoji font (e.g. Noto Color Emoji built
+  with COLRv1 support).
+- Apple Color Emoji only ships specific sbix sizes (20/40/64/96/160 px
+  on current macOS). We render at 160 into a padded 200² RGBA canvas
+  (`int(160*1.25)`) so ZWJ sequences with overhang aren't clipped, then
+  Lanczos-upscale to ~62% of the canvas edge (~870 px for 1400² output).
+  Going much above 6× starts to soften noticeably.
+- Gradient colours come from `_stable_hues()` — a hash of the episode
+  title yields two hues 80–160° apart on the wheel, so every episode
+  gets a distinct but reproducible look. Same title in, same colours
+  out. The gradient is built as a 1-px horizontal ramp resized to a
+  square and rotated 45° for a diagonal sweep.
+- Bytes are written via `.<basename>.png.partial` + `Path.replace()`
+  (atomic rename) so a crash mid-write can never leave behind a
+  half-flushed `<hash>.png` that the idempotency check would later
+  treat as finished.
+- Falls back to `COVER_DEFAULT_EMOJI` (🎙️ by default) whenever the
+  sidecar JSON has no `notebook_emoji` — manually-dropped MP3s,
+  `--url`-forced scraper runs, and legacy episodes scraped before
+  emoji capture was added. `notebook_emoji` itself is captured by
+  `scraper.py`'s `parse_card_emoji()` from the first line of each
+  home-page card and stored in the JSON.
 - Failures don't block the rest of the pass; logged and moved on. The
   pass is also a no-op when there are no missing covers, so reruns of
   `scraper.py` are cheap.
-- **No negative-prompt support**: Ollama's `/api/generate` schema has no
-  `negative_prompt` field, so the "no text, no logos" line in the
-  default style prompt is just a hint — FLUX will still render
-  typography. If text-free covers matter, restyle `COVER_STYLE_PROMPT`
-  to lean abstract/non-figurative rather than fighting the prior.
 
 ## Cloud app (FastAPI) specifics
 

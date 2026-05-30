@@ -379,6 +379,7 @@ def _extract_via_anchors(page: Page) -> list[dict]:
         out.append({
             "id": nb_id, "url": url,
             "title": title or f"(untitled {nb_id[:8]})",
+            "emoji": parse_card_emoji(card_text),
             "modified": modified,
             "modified_raw": modified_raw or "",
         })
@@ -428,6 +429,7 @@ def _extract_via_rows(page: Page) -> list[dict]:
             "id": nb_id,
             "url": f"https://notebooklm.google.com/notebook/{nb_id}",
             "title": title or f"(untitled {nb_id[:8]})",
+            "emoji": parse_card_emoji(text),
             "modified": modified,
             "modified_raw": modified_raw or "",
         })
@@ -487,6 +489,26 @@ def _looks_like_real_title(line: str) -> bool:
     return len(stripped) >= 5 and bool(re.search(r"[A-Za-z]", stripped))
 
 
+def parse_card_emoji(text: str) -> str:
+    """Extract the leading emoji icon from a notebook card's text, if present.
+
+    NotebookLM auto-assigns an emoji to every notebook and renders it as the
+    first line of each card on the home page (above the title). We capture it
+    so cover-art generation can use it as the per-episode visual identity.
+    Returns "" if the first line already looks like a title (no separate icon).
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    first = lines[0]
+    stripped = _EMOJI_ONLY_STRIPPER.sub("", first)
+    # If the first line has any ASCII alphanumeric content it's the title,
+    # not a standalone icon. Some cards just don't have an emoji.
+    if re.search(r"[A-Za-z0-9]", stripped):
+        return ""
+    return first
+
+
 def parse_card_text(text: str) -> tuple[str, str]:
     """Split a notebook card's text into (title, date_raw).
 
@@ -519,6 +541,48 @@ def parse_card_text(text: str) -> tuple[str, str]:
         if date_raw:
             break
     return title, date_raw
+
+
+def backfill_emojis_into_json(notebooks: list[dict]) -> int:
+    """Update any *.json in OUTPUT_DIR whose `notebook_emoji` is missing or
+    empty by looking the notebook_id up in `notebooks` (output of
+    list_notebooks()). Stale cover PNGs for those entries are deleted so the
+    next cover-art pass regenerates them with the correct emoji.
+
+    Returns the number of sidecars updated. Idempotent: JSONs that already
+    carry an emoji are left untouched.
+    """
+    if OUTPUT_DIR is None or not OUTPUT_DIR.exists():
+        return 0
+    by_id = {n["id"]: n.get("emoji") for n in notebooks if n.get("emoji")}
+    if not by_id:
+        return 0
+    updated = 0
+    for jp in sorted(OUTPUT_DIR.glob("*.json")):
+        try:
+            meta = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Backfill: cannot parse %s (%s); skipping.", jp.name, e)
+            continue
+        if meta.get("notebook_emoji"):
+            continue
+        emoji = by_id.get(meta.get("notebook_id") or "")
+        if not emoji:
+            continue
+        meta["notebook_emoji"] = emoji
+        jp.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+        # Nuke any stale cover so the next cover-art pass renders the real
+        # emoji instead of leaving COVER_DEFAULT_EMOJI baked in.
+        png = jp.with_suffix(".png")
+        if png.exists():
+            png.unlink()
+            log.info("Backfilled emoji %s into %s (stale PNG removed).", emoji, jp.name)
+        else:
+            log.info("Backfilled emoji %s into %s.", emoji, jp.name)
+        updated += 1
+    return updated
 
 
 def select_candidates(
@@ -788,6 +852,11 @@ def save_episode(
         "pub_date": now.isoformat(),
         "notebook_id": (notebook or {}).get("id"),
         "notebook_url": (notebook or {}).get("url"),
+        # NotebookLM's auto-assigned notebook icon. Captured from the home-page
+        # card (see parse_card_emoji) and used by coverart.py as the cover
+        # symbol. Only present in --list-driven runs; --url overrides have no
+        # card to read from and leave this null.
+        "notebook_emoji": (notebook or {}).get("emoji") or None,
         "notebook_modified": (
             notebook["modified"].isoformat()
             if notebook and notebook.get("modified") else None
@@ -827,9 +896,41 @@ def run_list() -> None:
             print(f"Found {len(notebooks)} notebook(s):")
             for n in notebooks:
                 mod = n["modified"].isoformat() if n["modified"] else f"?  raw={n['modified_raw']!r}"
-                print(f"  - {n['id']}  {mod}  {n['title']}")
+                emoji = n.get("emoji") or "·"
+                print(f"  - {n['id']}  {mod}  {emoji}  {n['title']}")
         finally:
             ctx.close()
+
+
+def run_backfill() -> None:
+    """Fetch the notebook list, write notebook_emoji into any sidecar JSON
+    that's missing it, drop the now-stale cover PNG, and rerun the cover-art
+    pass. Useful after upgrading from a scraper version that didn't capture
+    emojis (or for notebooks originally scraped via --url)."""
+    require_output_dir()
+    assert OUTPUT_DIR is not None
+    with sync_playwright() as pw:
+        ctx = launch_context(pw, headless=True)
+        try:
+            page = ctx.new_page()
+            page.set_default_timeout(UI_TIMEOUT_MS)
+            notebooks = list_notebooks(page)
+        finally:
+            ctx.close()
+    if not notebooks:
+        log.info("No notebooks visible; nothing to backfill.")
+        return
+    n_back = backfill_emojis_into_json(notebooks)
+    log.info("Backfill done. %d sidecar(s) updated.", n_back)
+    if n_back:
+        from coverart import cover_missing
+        cover_missing(OUTPUT_DIR)
+        # Re-tag MP3s so the embedded APIC picks up the new cover.
+        try:
+            from id3tag import tag_missing
+            tag_missing(OUTPUT_DIR)
+        except Exception as e:  # noqa: BLE001
+            log.warning("ID3 retag failed: %s", e)
 
 
 def _process_notebook(page: Page, notebook: Optional[dict], url: str, state: dict) -> bool:
@@ -886,6 +987,15 @@ def run_scrape(url_override: Optional[str]) -> None:
             if not notebooks:
                 log.info("No notebooks visible; nothing to do.")
                 return
+
+            # Opportunistic emoji backfill: any episode whose JSON sidecar
+            # predates the notebook_emoji field (or that was scraped via
+            # --url with no card to read) gets its emoji filled in now,
+            # and the stale cover deleted so the cover-art pass below
+            # rerenders it with the right glyph.
+            n_back = backfill_emojis_into_json(notebooks)
+            if n_back:
+                log.info("Backfilled notebook_emoji into %d sidecar(s).", n_back)
 
             undated = [n for n in notebooks if n["modified"] is None]
             if undated:
@@ -965,12 +1075,19 @@ def main() -> None:
     group.add_argument("--login", action="store_true", help="Open headful browser to sign into Google.")
     group.add_argument("--list", action="store_true", help="List notebooks on the home page and exit.")
     group.add_argument("--url", type=str, default=None, help="Scrape this specific notebook URL (ignores state).")
+    group.add_argument(
+        "--backfill-emojis", action="store_true",
+        help="Fetch the notebook list, write notebook_emoji into any sidecar JSON missing it, "
+             "drop the stale cover PNG, and rerender + retag covers.",
+    )
     args = parser.parse_args()
 
     if args.login:
         run_login()
     elif args.list:
         run_list()
+    elif args.backfill_emojis:
+        run_backfill()
     else:
         run_scrape(args.url)
 

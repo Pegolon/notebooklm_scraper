@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
 """
-Generate PNG cover-art images for MP3 files in OUTPUT_DIR using a local Ollama
-instance running an image-generation model (e.g. FLUX.2 Klein).
+Generate PNG cover art for MP3 files in OUTPUT_DIR.
 
-For every <basename>.mp3 without a matching <basename>.png, read the sibling
-<basename>.json description and ask Ollama for a cover image themed by that
-description, on top of a fixed global style so all cover art shares a
-consistent look.
+For every <basename>.mp3 without a matching <basename>.png we read the sibling
+<basename>.json, grab the ``notebook_emoji`` field that scraper.py captured
+from NotebookLM's auto-assigned notebook icon (falling back to
+``COVER_DEFAULT_EMOJI`` when none is available), and render a 1400×1400 PNG
+showing that emoji full-bleed on top of a gradient-filled circle.
+
+Implementation note: rendering Apple Color Emoji's sbix bitmap tables
+requires Pillow — ImageMagick + FreeType on macOS only sees the glyph
+outlines (you get a black silhouette). Pillow handles the bitmap directly
+when you pass ``embedded_color=True``, so we use it for the whole pipeline.
 
   uv run coverart.py                  # generate covers for all MP3s missing one
   uv run coverart.py --file foo.mp3   # generate cover for a single file
   uv run coverart.py --force          # regenerate even if a .png already exists
-
-Configured via OLLAMA_BASE_URL and OLLAMA_IMAGE_MODEL in .env.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
+import colorsys
+import hashlib
 import json
 import logging
 import os
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
@@ -46,36 +49,31 @@ OUTPUT_DIR = (
     if os.environ.get("OUTPUT_DIR")
     else None
 )
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
-OLLAMA_IMAGE_MODEL = os.environ.get("OLLAMA_IMAGE_MODEL", "x/flux2-klein:9b").strip()
 
-# Image dimensions and diffusion steps. Defaults stay small so a full cover
-# fits comfortably inside the COVER_TIMEOUT_S window on modest hardware
-# (~2 min for 512×512 / 12 steps on FLUX.2 Klein 9B). Crank these up via
-# .env if your Ollama host is beefy enough.
-COVER_WIDTH = int(os.environ.get("COVER_WIDTH", "512"))
-COVER_HEIGHT = int(os.environ.get("COVER_HEIGHT", "512"))
-COVER_STEPS = int(os.environ.get("COVER_STEPS", "12"))
+# Final cover dimensions. Apple Podcasts wants 1400×1400 minimum.
+COVER_SIZE = int(os.environ.get("COVER_SIZE", "1400"))
 
-# Image generation can take a while (cold model load + ~30s diffusion on CPU
-# or modest GPUs). Set a generous timeout for the HTTP call.
-COVER_TIMEOUT_S = int(os.environ.get("COVER_TIMEOUT_S", "600"))
+# Fallback emoji used when the sidecar JSON has no notebook_emoji (e.g. for
+# manually-dropped MP3s or pre-existing episodes scraped before emoji capture
+# was added).
+DEFAULT_EMOJI = (os.environ.get("COVER_DEFAULT_EMOJI", "🎙️").strip() or "🎙️")
 
-# Global style prompt — every cover image is generated with this prefix so the
-# whole podcast feed shares one visual identity. Override via env if you want
-# a different look without touching code.
-DEFAULT_STYLE_PROMPT = (
-    "Podcast cover art, square 1:1 composition, centered subject, "
-    "bold flat-vector illustration with a soft grain texture, "
-    "limited palette of deep indigo, warm amber, and off-white, "
-    "subtle geometric background shapes, clean and modern editorial feel, "
-    "no text, no logos, no watermarks, no faces of real people, "
-    "high contrast so it reads well as a small thumbnail."
-)
-COVER_STYLE_PROMPT = os.environ.get("COVER_STYLE_PROMPT", "").strip() or DEFAULT_STYLE_PROMPT
+# Path to Apple Color Emoji. The font only ships specific sbix bitmap sizes
+# (20 / 40 / 64 / 96 / 160 px on current macOS); 160 is the largest we can
+# ask for, and we upscale from there to whatever we need on the canvas.
+APPLE_EMOJI_FONT = os.environ.get(
+    "APPLE_EMOJI_FONT", "/System/Library/Fonts/Apple Color Emoji.ttc"
+).strip()
+_APPLE_EMOJI_SBIX_SIZE = 160
 
-# How much of the (often long) description to feed into the image model.
-_DESCRIPTION_CHAR_LIMIT = 1200
+# Fraction of the canvas the emoji bitmap occupies (square, centered). 0.75
+# keeps the emoji inscribed (roughly) inside the gradient circle while making
+# it big enough to read as the dominant visual element.
+_EMOJI_FRACTION = 0.75
+
+# Fraction of the canvas occupied by the circle (centered). 0.97 keeps a tiny
+# margin so the gradient doesn't bleed into the very corner pixels.
+_CIRCLE_FRACTION = 0.97
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,125 +83,187 @@ logging.basicConfig(
 log = logging.getLogger("coverart")
 
 
-def _load_description(mp3: Path) -> tuple[str, str]:
-    """Return (title, description) for the given MP3 by reading its sidecar JSON.
-    Falls back to filename-derived defaults if the JSON is missing/unreadable."""
+# ---------------------------------------------------------------------------
+# Sidecar JSON → (emoji, seed)
+# ---------------------------------------------------------------------------
+
+def _load_metadata(mp3: Path) -> tuple[str, str]:
+    """Return (emoji, seed) for the given MP3.
+
+    ``emoji`` is what we render; we prefer the sidecar JSON's
+    ``notebook_emoji`` (captured by scraper.py from NotebookLM's auto-icon)
+    and fall back to ``DEFAULT_EMOJI`` for anything else (manual MP3s,
+    legacy episodes, etc.).
+
+    ``seed`` is what we hash to pick stable per-episode gradient hues — the
+    title + emoji combination, or the filename if no JSON is present. Same
+    inputs always produce the same colours, but each episode gets its own.
+    """
     json_path = mp3.with_suffix(".json")
-    title = mp3.stem
-    description = ""
+    emoji = ""
+    title = ""
     if json_path.exists():
         try:
             meta = json.loads(json_path.read_text(encoding="utf-8"))
-            title = (meta.get("title") or title).strip()
-            description = (meta.get("description") or "").strip()
+            emoji = (meta.get("notebook_emoji") or "").strip()
+            title = (meta.get("title") or "").strip()
         except Exception as e:  # noqa: BLE001
             log.warning("Could not parse %s: %s", json_path.name, e)
-    return title, description
+    return emoji or DEFAULT_EMOJI, (title or mp3.stem)
 
 
-def _build_prompt(title: str, description: str) -> str:
-    snippet = description[:_DESCRIPTION_CHAR_LIMIT].strip()
-    if len(description) > _DESCRIPTION_CHAR_LIMIT:
-        snippet += " …"
-    parts = [COVER_STYLE_PROMPT, "", f"Episode title: {title}"]
-    if snippet:
-        parts += ["", "Episode summary (use as thematic inspiration only):", snippet]
-    parts += [
-        "",
-        "Design a cover image whose imagery evokes the themes and mood of the "
-        "summary above, while strictly adhering to the global style guide. "
-        "Do not render any text or letters in the image.",
-    ]
-    return "\n".join(parts)
+# ---------------------------------------------------------------------------
+# Drawing primitives
+# ---------------------------------------------------------------------------
+
+def _stable_hues(seed: str) -> tuple[float, float]:
+    """Two distinct hue values in [0, 1) derived from a stable hash of seed."""
+    digest = hashlib.md5(seed.encode("utf-8")).digest()
+    h1 = digest[0] / 255.0
+    # Offset second hue by ~80°–160° around the wheel so the gradient always
+    # has visible variation (rather than two near-identical tones).
+    spread = 80 + (digest[1] % 80)  # 80..159
+    h2 = ((digest[0] + spread) % 256) / 255.0
+    return h1, h2
 
 
-def _ollama_generate_image(prompt: str) -> bytes:
-    """POST to Ollama's /api/generate (streaming) and return PNG bytes.
+def _hsv_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return int(r * 255), int(g * 255), int(b * 255)
 
-    Uses stream=true so we get a JSONL response: per-step progress lines
-    (``{"completed": N, "total": M, "done": false}``) followed by a final
-    line carrying ``{"image": "<base64>", "done": true}``. Streaming also
-    means the socket timeout is per-chunk, not for the whole generation —
-    a 20-step 1024² render on a cold model load doesn't trip it.
+
+def _build_gradient(size: int, color_a: tuple[int, int, int],
+                    color_b: tuple[int, int, int]) -> Image.Image:
+    """Diagonal (top-left → bottom-right) linear gradient of size×size."""
+    # Build a single-pixel-wide ramp, then rotate+resize to the full square.
+    # Pure-Python putpixel over 1.96M pixels is slow; this is ~instant.
+    ramp = Image.new("RGB", (size, 1))
+    for x in range(size):
+        t = x / max(size - 1, 1)
+        ramp.putpixel((x, 0), (
+            int(color_a[0] * (1 - t) + color_b[0] * t),
+            int(color_a[1] * (1 - t) + color_b[1] * t),
+            int(color_a[2] * (1 - t) + color_b[2] * t),
+        ))
+    horizontal = ramp.resize((size, size))
+    # Rotate 45° around the centre and crop back to size so the gradient
+    # runs corner-to-corner. We expand first to avoid black wedge edges,
+    # then centre-crop.
+    rotated = horizontal.rotate(45, resample=Image.BICUBIC, expand=True)
+    rw, rh = rotated.size
+    left = (rw - size) // 2
+    top = (rh - size) // 2
+    return rotated.crop((left, top, left + size, top + size))
+
+
+def _build_circle_mask(size: int) -> Image.Image:
+    inset = int(size * (1 - _CIRCLE_FRACTION) / 2)
+    mask = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.ellipse((inset, inset, size - inset - 1, size - inset - 1), fill=255)
+    return mask
+
+
+def _render_emoji(emoji: str, target_px: int) -> Image.Image:
+    """Render `emoji` into a transparent RGBA image `target_px` square.
+
+    Apple Color Emoji's largest sbix strike is 160 px and the font reports
+    ascent=160 / descent=50, so Pillow's `anchor="mm"` aims at the middle
+    of the *line box* (y≈105) rather than the middle of the glyph (y≈80).
+    With a tight render canvas this clips the top of the bitmap by ~25 px
+    in native scale — magnified into a very visible bite at 1400² output.
+
+    To avoid both clipping and font-metric centering bugs we:
+
+    1. render onto a generously oversized canvas so nothing can spill off,
+    2. crop to the actual non-transparent bbox of the glyph,
+    3. pad to a square so subsequent scaling stays proportional,
+    4. Lanczos-upscale to `target_px`,
+    5. apply a gentle unsharp mask to recover edge crispness lost in the
+       5–6× upscale from the 160-px source.
     """
-    url = f"{OLLAMA_BASE_URL}/api/generate"
-    payload = {
-        "model": OLLAMA_IMAGE_MODEL,
-        "prompt": prompt,
-        "stream": True,
-        "width": COVER_WIDTH,
-        "height": COVER_HEIGHT,
-        "steps": COVER_STEPS,
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    try:
+        font = ImageFont.truetype(APPLE_EMOJI_FONT, _APPLE_EMOJI_SBIX_SIZE)
+    except OSError as e:
+        raise RuntimeError(
+            f"Could not load Apple Color Emoji from {APPLE_EMOJI_FONT}. "
+            "Set APPLE_EMOJI_FONT in .env to point at a sbix/COLR-bearing font."
+        ) from e
+
+    # 2× the strike size is generous enough for any ZWJ sequence or
+    # ascender overhang we've seen.
+    pad = _APPLE_EMOJI_SBIX_SIZE * 2
+    canvas = Image.new("RGBA", (pad, pad), (0, 0, 0, 0))
+    ImageDraw.Draw(canvas).text(
+        (pad / 2, pad / 2), emoji,
+        font=font, embedded_color=True, anchor="mm",
     )
 
-    b64: Optional[str] = None
-    try:
-        with urllib.request.urlopen(req, timeout=COVER_TIMEOUT_S) as resp:
-            for raw_line in resp:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    log.debug("Skipping non-JSON line from Ollama: %r", line[:120])
-                    continue
-                if msg.get("error"):
-                    raise RuntimeError(f"Ollama error: {msg['error']}")
-                if "completed" in msg and "total" in msg and not msg.get("done"):
-                    log.info("  step %s/%s", msg["completed"], msg["total"])
-                    continue
-                if msg.get("done"):
-                    b64 = msg.get("image") or (msg.get("images") or [None])[0]
-                    break
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            pass
-        raise RuntimeError(f"Ollama HTTP {e.code} from {url}: {detail or e.reason}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Cannot reach Ollama at {url}: {e.reason}") from e
+    bbox = canvas.getbbox()
+    if bbox is None:
+        # Empty/unsupported glyph — return a fully-transparent square so
+        # the rest of the pipeline keeps working (we'll just paint a
+        # gradient circle with no symbol on top).
+        return Image.new("RGBA", (target_px, target_px), (0, 0, 0, 0))
 
-    if not b64:
-        raise RuntimeError("Ollama stream ended without an image payload.")
-    try:
-        return base64.b64decode(b64)
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"Failed to decode base64 image from Ollama: {e}") from e
+    cropped = canvas.crop(bbox)
+    cw, ch = cropped.size
+    side = max(cw, ch)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(cropped, ((side - cw) // 2, (side - ch) // 2), cropped)
 
+    big = square.resize((target_px, target_px), Image.LANCZOS)
+    # Very gentle unsharp to reclaim a touch of edge crispness without
+    # amplifying the JPEG-ish artefacts baked into Apple's sbix PNGs
+    # (radius>1 or percent>40 makes high-contrast outlines visibly noisy).
+    big = big.filter(ImageFilter.UnsharpMask(radius=0.8, percent=35, threshold=4))
+    return big
+
+
+# ---------------------------------------------------------------------------
+# Per-file driver
+# ---------------------------------------------------------------------------
 
 def generate_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
-    """Generate a <basename>.png cover next to mp3 via Ollama. Returns the PNG
-    path (or None if it already existed and force=False). Raises on failure."""
+    """Render <basename>.png next to mp3. Returns the PNG path or None when
+    a cover already exists and force=False."""
     png_path = mp3.with_suffix(".png")
     if png_path.exists() and not force:
         log.info("Cover already exists for %s; skipping.", mp3.name)
         return None
 
-    title, description = _load_description(mp3)
-    prompt = _build_prompt(title, description)
-
+    emoji, seed = _load_metadata(mp3)
     log.info(
-        "Generating cover for %s via %s @ %s (%dx%d, %d steps)...",
-        mp3.name, OLLAMA_IMAGE_MODEL, OLLAMA_BASE_URL,
-        COVER_WIDTH, COVER_HEIGHT, COVER_STEPS,
+        "Rendering cover for %s (emoji=%r, %d×%d)...",
+        mp3.name, emoji, COVER_SIZE, COVER_SIZE,
     )
-    png_bytes = _ollama_generate_image(prompt)
-    png_path.write_bytes(png_bytes)
+
+    h1, h2 = _stable_hues(seed)
+    color_a = _hsv_rgb(h1, 0.62, 0.88)
+    color_b = _hsv_rgb(h2, 0.55, 0.55)
+
+    canvas = Image.new("RGB", (COVER_SIZE, COVER_SIZE), (250, 250, 252))
+    gradient = _build_gradient(COVER_SIZE, color_a, color_b)
+    mask = _build_circle_mask(COVER_SIZE)
+    canvas.paste(gradient, (0, 0), mask)
+
+    emoji_px = int(COVER_SIZE * _EMOJI_FRACTION)
+    emoji_img = _render_emoji(emoji, emoji_px)
+    offset = (COVER_SIZE - emoji_px) // 2
+    canvas.paste(emoji_img, (offset, offset), emoji_img)
+
+    # Write via a hidden partial file + atomic rename so a crash mid-write
+    # can't leave behind a half-flushed <hash>.png that the idempotency
+    # check would later treat as finished.
+    tmp = png_path.with_name(f".{png_path.name}.partial")
+    canvas.save(tmp, "PNG", optimize=True)
+    tmp.replace(png_path)
     log.info("Wrote %s (%d bytes).", png_path.name, png_path.stat().st_size)
     return png_path
 
 
 def cover_missing(output_dir: Path) -> tuple[int, int]:
-    """Find every *.mp3 in output_dir lacking a matching *.png and generate one.
+    """Find every *.mp3 in output_dir lacking a matching *.png and render one.
     Returns (successes, failures)."""
     missing = sorted(
         mp3 for mp3 in output_dir.glob("*.mp3")
@@ -234,7 +294,9 @@ def _require_config() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--file", type=str, default=None,
         help="Generate a cover for one specific MP3 file (path) instead of scanning OUTPUT_DIR.",

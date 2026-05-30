@@ -119,8 +119,10 @@ def _vtt_to_text(vtt_path: Path) -> str:
 
 _SYSTEM_INSTRUCTIONS = (
     "You are an editor preparing podcast episode metadata. "
-    "Given a transcript of an audio episode, you produce a concise title and "
-    "a clear, well-written description summarising the content. "
+    "Given a transcript of an audio episode, you produce a concise title, "
+    "a clear well-written description summarising the content, and a single "
+    "emoji that captures the episode's main subject (used as the cover-art "
+    "icon). "
     "Write the description in neutral, informative prose (no marketing fluff, "
     "no first-person references to 'this transcript'). "
     "Respond with strict JSON only — no markdown, no commentary."
@@ -140,12 +142,85 @@ def _build_prompt(transcript: str) -> str:
         "Respond with a JSON object with exactly these keys:\n"
         '  "title":       a concise episode title, max 80 characters, no quotes.\n'
         '  "description": a 2–4 paragraph plain-prose summary of the episode content.\n'
+        '  "emoji":       a single emoji glyph that thematically represents the\n'
+        "                 episode (e.g. 🧬 for biology, 🪐 for astronomy, 🏛️ for\n"
+        "                 history). Prefer concrete subject-matter symbols over\n"
+        "                 generic ones like 🎙️ or 🎧. Output the emoji character\n"
+        "                 itself, not a name or shortcode. Exactly one emoji.\n"
     )
 
 
-def _ollama_summarise(transcript: str) -> tuple[str, str]:
+# Match a single user-perceived emoji "cluster": one base emoji codepoint plus
+# any trailing variation selectors / skin-tone modifiers / ZWJ-joined extra
+# emoji codepoints. We don't try to enumerate every Unicode emoji block;
+# instead we accept anything in the Extended_Pictographic ranges that the
+# model is realistically going to output, and reject ASCII / letters /
+# punctuation so a model that writes "microphone" or ":mic:" gets rejected.
+_EMOJI_BASE_RANGES = (
+    (0x1F300, 0x1FAFF),  # Misc symbols & pictographs, transport, food, supplemental, symbols&pictographs ext-A
+    (0x2600, 0x27BF),    # Misc symbols, dingbats
+    (0x1F000, 0x1F2FF),  # Mahjong, domino, playing cards, enclosed alphanum supplement
+    (0x2300, 0x23FF),    # Misc technical (⌚, ⌛, ⏰, …)
+    (0x2B00, 0x2BFF),    # Misc symbols and arrows (⭐, ⬆, …)
+    (0x1F1E6, 0x1F1FF),  # Regional indicator symbols (flags)
+)
+_EMOJI_JOIN_CODEPOINTS = {
+    0xFE0E, 0xFE0F,  # text / emoji variation selectors
+    0x200D,           # zero-width joiner
+    *range(0x1F3FB, 0x1F400),  # skin-tone modifiers
+    *range(0xE0020, 0xE0080),  # tag sequences (e.g. subdivision flags)
+    0xE007F,          # cancel tag
+}
+
+
+def _is_emoji_base(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _EMOJI_BASE_RANGES)
+
+
+def _extract_emoji(raw: str) -> Optional[str]:
+    """Pull the first valid emoji cluster from `raw` and return it (or None).
+
+    Accepts a leading base emoji codepoint plus any following variation
+    selectors, skin-tone modifiers, and ZWJ-joined extra emoji codepoints
+    (so 🏃‍♂️, 🇪🇺, 👨‍👩‍👧 all survive intact). Rejects anything that's
+    plainly text — if the model wrote "microphone" or ":mic:" we return
+    None and let coverart.py fall back to COVER_DEFAULT_EMOJI.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    chars = list(s)
+    # The first codepoint must itself be an emoji base.
+    if not _is_emoji_base(ord(chars[0])):
+        return None
+    out = [chars[0]]
+    i = 1
+    while i < len(chars):
+        cp = ord(chars[i])
+        if cp in _EMOJI_JOIN_CODEPOINTS:
+            out.append(chars[i])
+            i += 1
+            continue
+        # After a ZWJ, allow another emoji base.
+        if out[-1] == "\u200d" and _is_emoji_base(cp):
+            out.append(chars[i])
+            i += 1
+            continue
+        # Two regional indicators in a row form a flag.
+        if (0x1F1E6 <= ord(out[-1]) <= 0x1F1FF) and (0x1F1E6 <= cp <= 0x1F1FF):
+            out.append(chars[i])
+            i += 1
+            continue
+        break
+    return "".join(out)
+
+
+def _ollama_summarise(transcript: str) -> tuple[str, str, Optional[str]]:
     """POST the transcript to Ollama's /api/generate (JSON mode) and return
-    (title, description). Raises on any failure or schema violation."""
+    (title, description, emoji). emoji is None if the model didn't return a
+    parseable single-emoji glyph. Raises on any failure or schema violation."""
     url = f"{OLLAMA_BASE_URL}/api/generate"
     payload = {
         "model": OLLAMA_TEXT_MODEL,
@@ -199,7 +274,14 @@ def _ollama_summarise(transcript: str) -> tuple[str, str]:
         raise RuntimeError(
             f"Model JSON missing required fields (title/description): {parsed!r}"
         )
-    return title, description
+    emoji_raw = str(parsed.get("emoji", "") or "").strip()
+    emoji = _extract_emoji(emoji_raw)
+    if emoji_raw and not emoji:
+        # The model emitted something for the emoji slot but it didn't parse
+        # as one (e.g. ":mic:", "microphone", "🎙️ - microphone"). Log and
+        # move on; coverart.py will use COVER_DEFAULT_EMOJI.
+        log.warning("Model returned non-emoji value for emoji field: %r", emoji_raw)
+    return title, description, emoji
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +313,9 @@ def summarise_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
         "Summarising %s (%d chars) via %s @ %s ...",
         vtt_path.name, len(transcript), OLLAMA_TEXT_MODEL, OLLAMA_BASE_URL,
     )
-    llm_title, description = _ollama_summarise(transcript)
+    llm_title, description, emoji = _ollama_summarise(transcript)
+    if emoji:
+        log.info("Model picked emoji %s for %s.", emoji, mp3.name)
 
     # Build a title that matches scraper.py's `<prefix> - <topic>` shape so the
     # feed reads consistently. If the LLM already prepended the prefix, don't
@@ -253,6 +337,12 @@ def summarise_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
         "pub_date": pub_date.isoformat(),
         "notebook_id": None,
         "notebook_url": None,
+        # Manually-dropped MP3s have no NotebookLM card to read an icon from,
+        # so we ask the summarisation LLM to pick a fitting subject-matter
+        # emoji from the transcript. None means the model declined or
+        # returned non-emoji text — coverart.py then falls back to
+        # COVER_DEFAULT_EMOJI.
+        "notebook_emoji": emoji,
         "notebook_modified": None,
         "source": "manual",
     }
@@ -261,6 +351,98 @@ def summarise_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
     )
     log.info("Wrote %s (%d bytes).", json_path.name, json_path.stat().st_size)
     return json_path
+
+
+def _ollama_pick_emoji(transcript: str) -> Optional[str]:
+    """Ask the LLM for *only* a fitting emoji given a transcript. Used by the
+    --backfill-emojis mode to upgrade existing manual sidecars without
+    rewriting their title/description. Returns None on any failure so the
+    backfill loop can keep going."""
+    snippet = transcript[:_TRANSCRIPT_CHAR_LIMIT]
+    if len(transcript) > _TRANSCRIPT_CHAR_LIMIT:
+        snippet += "\n\n[... transcript truncated for length ...]"
+    prompt = (
+        "Choose a single emoji that best represents the subject matter of "
+        "the audio transcript below. Prefer concrete subject-matter symbols "
+        "(🧬, 🪐, 🏛️, 🦀, …) over generic ones like 🎙️ or 🎧. Output strict "
+        'JSON only — no markdown, no commentary — in the form {"emoji": "X"} '
+        "where X is the emoji character itself, not a name or shortcode.\n\n"
+        "Transcript:\n"
+        f'"""\n{snippet}\n"""\n'
+    )
+    payload = {
+        "model": OLLAMA_TEXT_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.3},
+    }
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SUMMARY_TIMEOUT_S) as resp:
+            envelope = json.loads(resp.read().decode("utf-8", errors="replace"))
+        parsed = json.loads(envelope.get("response") or "{}")
+        return _extract_emoji(str(parsed.get("emoji", "") or "").strip())
+    except Exception as e:  # noqa: BLE001
+        log.warning("Emoji-only LLM call failed: %s", e)
+        return None
+
+
+def backfill_emojis(output_dir: Path) -> int:
+    """Walk *.json sidecars in output_dir whose notebook_emoji is missing /
+    empty and that carry a matching *.vtt transcript, ask the LLM for a
+    fitting emoji, write it back, and delete the now-stale cover PNG so
+    coverart.py rerenders. Skips entries that already have an emoji and
+    those without a transcript. Returns the number of sidecars updated."""
+    candidates = []
+    for jp in sorted(output_dir.glob("*.json")):
+        try:
+            meta = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Backfill: cannot parse %s (%s); skipping.", jp.name, e)
+            continue
+        if meta.get("notebook_emoji"):
+            continue
+        vtt = jp.with_suffix(".vtt")
+        if not vtt.exists():
+            log.info(
+                "Backfill: %s has no transcript yet; skipping "
+                "(run transcribe.py first).", jp.name,
+            )
+            continue
+        candidates.append((jp, meta, vtt))
+    if not candidates:
+        log.info("Emoji backfill: nothing to do.")
+        return 0
+
+    log.info("Emoji backfill: %d sidecar(s) missing notebook_emoji.", len(candidates))
+    updated = 0
+    for jp, meta, vtt in candidates:
+        text = _vtt_to_text(vtt)
+        if not text:
+            log.warning("Backfill: %s transcript is empty; skipping.", vtt.name)
+            continue
+        emoji = _ollama_pick_emoji(text)
+        if not emoji:
+            log.warning("Backfill: no usable emoji returned for %s.", jp.name)
+            continue
+        meta["notebook_emoji"] = emoji
+        jp.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+        png = jp.with_suffix(".png")
+        if png.exists():
+            png.unlink()
+            log.info("Backfilled emoji %s into %s (stale PNG removed).", emoji, jp.name)
+        else:
+            log.info("Backfilled emoji %s into %s.", emoji, jp.name)
+        updated += 1
+    return updated
 
 
 def summarise_missing(output_dir: Path) -> tuple[int, int]:
@@ -322,10 +504,29 @@ def main() -> int:
         "--force", action="store_true",
         help="Regenerate the sidecar JSON even if it already exists.",
     )
+    parser.add_argument(
+        "--backfill-emojis", action="store_true",
+        help="Only walk existing sidecars with no notebook_emoji and ask the LLM "
+             "to pick one; preserves title/description. Triggers cover rerender + id3 retag.",
+    )
     args = parser.parse_args()
 
     _require_config()
     assert OUTPUT_DIR is not None
+
+    if args.backfill_emojis:
+        n = backfill_emojis(OUTPUT_DIR)
+        if n:
+            # Stale covers were deleted in-place; rerender them and re-embed
+            # the new APIC so podcatchers pick up the change.
+            from coverart import cover_missing
+            cover_missing(OUTPUT_DIR)
+            try:
+                from id3tag import tag_missing
+                tag_missing(OUTPUT_DIR)
+            except Exception as e:  # noqa: BLE001
+                log.warning("ID3 retag failed: %s", e)
+        return 0
 
     if args.file:
         mp3 = Path(args.file).expanduser().resolve()
