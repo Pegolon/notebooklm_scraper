@@ -17,7 +17,6 @@ INITIAL_SINCE_DATE (defaults to 2026-05-01).
 from __future__ import annotations
 
 import argparse
-import asyncio
 import hashlib
 import json
 import logging
@@ -882,30 +881,41 @@ def run_scrape(url_override: Optional[str]) -> None:
         finally:
             ctx.close()
 
-    # Run the transcription and cover-art passes concurrently. The two are
-    # fully independent (different sidecar files, different backends — MLX
-    # Whisper on-device vs. Ollama over HTTP), so we can let them overlap.
-    # Each underlying function is synchronous and blocking, so we hand them
-    # to a worker thread via asyncio.to_thread and gather the results.
+    # Run the post-passes sequentially. Order matters because each later
+    # pass depends on artefacts the earlier ones produced for manually-
+    # dropped audio (no JSON sidecar from the scraper itself):
+    #   1. convert    : .m4a → <md5(m4a-bytes)>.mp3 (ffmpeg, idempotent)
+    #   2. transcribe : MP3 → .vtt (MLX Whisper, on-device)
+    #   3. summarise  : .vtt → .json (Ollama text model, only acts when
+    #                                 a sidecar JSON is missing)
+    #   4. coverart   : .json + MP3 → .png (Ollama image model)
+    #   5. id3tag     : verify standard podcast ID3 frames on every MP3
+    #                   (uses the JSON sidecar + PNG cover; idempotent —
+    #                   only rewrites frames that are missing or stale)
+    # For scraper-downloaded notebooks passes 1 and 3 are no-ops because
+    # we already have an MP3 + JSON sidecar from save_episode().
     assert OUTPUT_DIR is not None
-    asyncio.run(_run_post_passes(OUTPUT_DIR))
+    _run_post_passes(OUTPUT_DIR)
 
 
-async def _run_post_passes(output_dir: Path) -> None:
+def _run_post_passes(output_dir: Path) -> None:
+    from convert import convert_missing
     from transcribe import transcribe_missing
+    from summarize import summarise_missing
     from coverart import cover_missing
+    from id3tag import tag_missing
 
-    async def _safe(name: str, fn, *args):
+    def _safe(name: str, fn, *args) -> None:
         try:
-            return await asyncio.to_thread(fn, *args)
+            fn(*args)
         except Exception as e:  # noqa: BLE001
             log.warning("%s pass failed: %s", name, e)
-            return None
 
-    await asyncio.gather(
-        _safe("Transcription", transcribe_missing, output_dir),
-        _safe("Cover-art", cover_missing, output_dir),
-    )
+    _safe("M4A conversion", convert_missing, output_dir)
+    _safe("Transcription", transcribe_missing, output_dir)
+    _safe("Summary", summarise_missing, output_dir)
+    _safe("Cover-art", cover_missing, output_dir)
+    _safe("ID3 verification", tag_missing, output_dir)
 
 
 # ---------------------------------------------------------------------------

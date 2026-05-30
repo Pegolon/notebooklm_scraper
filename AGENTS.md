@@ -35,7 +35,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 
 - **Python 3.14** (pinned via `.python-version` in each subdir)
 - **uv** for env / deps / lockfile (`uv sync`, `uv run …`)
-- **local/**: Playwright (Chromium), mlx-whisper, python-dotenv; cover-art pass talks to a remote Ollama HTTP API (no Python client dep)
+- **local/**: Playwright (Chromium), mlx-whisper, python-dotenv; cover-art and summarisation passes talk to a remote Ollama HTTP API (no Python client dep); M4A conversion shells out to `ffmpeg` (system binary on PATH)
 - **cloud/**: FastAPI, uvicorn[standard], python-dotenv
 - Standard library `xml.etree.ElementTree` for RSS (no extra dep)
 
@@ -43,12 +43,14 @@ and `README.md`. Never merge them — they ship to different hosts.
 
 | Path | Role |
 |---|---|
-| [local/scraper.py](local/scraper.py) | Playwright scraper. Lists notebooks, picks new ones, downloads audio, writes JSON, runs transcribe + cover-art passes at end. |
+| [local/scraper.py](local/scraper.py) | Playwright scraper. Lists notebooks, picks new ones, downloads audio, writes JSON, runs convert → transcribe → summarise → cover-art passes at end (sequential — order matters for manually-dropped audio). |
+| [local/convert.py](local/convert.py) | ffmpeg M4A → `<md5(m4a-bytes)>.mp3`. Scans for `.m4a` files; idempotent (hash-based output filename, skips if `<hash>.mp3` already exists). Standalone CLI + importable `convert_missing()`. |
 | [local/transcribe.py](local/transcribe.py) | MLX Whisper → WebVTT (on-device). Scans for MP3s missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
+| [local/summarize.py](local/summarize.py) | Ollama text model → `<basename>.json`. Scans for MP3s missing `.json` but having `.vtt`; strips VTT cue headers, asks Ollama (JSON mode) for `{title, description}`, writes a sidecar mirroring scraper.py's shape (`source: "manual"`). Standalone CLI + importable `summarise_missing()`. |
 | [local/coverart.py](local/coverart.py) | Ollama (e.g. FLUX.2 Klein) → `<hash>.png`. Scans for MP3s missing `.png`. Standalone CLI + importable `cover_missing()`. |
 | [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`. |
 | [local/.env.example](local/.env.example) | Local-side config template. |
-| [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware). |
+| [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware) + `GET /transcripts/{name}`. Reads files directly from `OUTPUT_DIR`. |
 | [cloud/pyproject.toml](cloud/pyproject.toml) | Deps: `fastapi`, `uvicorn[standard]`, `python-dotenv`. |
 | [cloud/.env.example](cloud/.env.example) | Cloud-side config template. |
 
@@ -63,8 +65,12 @@ uv run scraper.py --login              # one-time headful Google sign-in
 uv run scraper.py                      # main entry (cron-driven)
 uv run scraper.py --list               # debug: enumerate notebooks
 uv run scraper.py --url <URL>          # force a specific notebook
+uv run convert.py                      # transcode any .m4a files to <hash>.mp3
+uv run convert.py --file foo.m4a       # convert one file
 uv run transcribe.py                   # transcribe any MP3 missing a .vtt
 uv run transcribe.py --file foo.mp3    # transcribe one file
+uv run summarize.py                    # generate JSON sidecars for manual MP3s (needs .vtt)
+uv run summarize.py --file foo.mp3     # summarise one file
 uv run coverart.py                     # generate cover PNGs for any MP3 missing one
 uv run coverart.py --file foo.mp3      # generate one cover
 uv run coverart.py --force             # regenerate everything
@@ -95,6 +101,11 @@ to the same Google-Drive-synced folder.
   `x/flux2-klein:9b`), `COVER_WIDTH`/`COVER_HEIGHT` (default `512`),
   `COVER_STEPS` (default `12`), `COVER_TIMEOUT_S` (default `600`),
   `COVER_STYLE_PROMPT` (override the bundled global style guide).
+- Summarisation of manual MP3s (Ollama, same host): `OLLAMA_TEXT_MODEL`
+  (default `charaf/qwen3.6-35b-a3b-coding-nvfp4-mlx:latest`),
+  `SUMMARY_TIMEOUT_S` (default `600`). `TITLE_PREFIX` is reused to keep
+  manual episode titles in the same `<prefix> - <topic>` shape as scraper
+  output.
 
 `cloud/.env` knobs:
 - Required: `OUTPUT_DIR`, `FEED_BASE_URL` (the public URL of the FastAPI
@@ -104,6 +115,11 @@ to the same Google-Drive-synced folder.
   `FEED_OWNER_EMAIL`, `FEED_LANGUAGE`, `FEED_CATEGORY`, `FEED_IMAGE_URL`,
   `FEED_LINK`
 
+The cloud app assumes the `OUTPUT_DIR` folder is reachable as a regular
+filesystem path. On hosts that can't mount Google Drive directly, run the
+cloud app on the Mac Mini (where Drive is mounted) and expose it via
+Tailscale Serve/Funnel, Cloudflare Tunnel, or similar.
+
 ### Path-value normalization (important gotcha)
 
 Users naturally write shell-style escapes in `.env`:
@@ -112,10 +128,10 @@ OUTPUT_DIR=/Users/.../My\ Drive/Podcasts        # backslash escape
 OUTPUT_DIR="/Users/.../My Drive/Podcasts"       # quoted
 ```
 `python-dotenv` reads values **literally** — it does not unescape `\ ` or
-strip quotes. All four scripts (`local/scraper.py`, `local/transcribe.py`,
-`local/coverart.py`, `cloud/app.py`) defensively run path values through
-`_clean_path_value()` to handle both styles. Keep this helper when adding
-new scripts.
+strip quotes. All six scripts (`local/scraper.py`, `local/convert.py`,
+`local/transcribe.py`, `local/summarize.py`, `local/coverart.py`,
+`cloud/app.py`) defensively run path values through `_clean_path_value()`
+to handle both styles. Keep this helper when adding new scripts.
 
 ## Data model
 
@@ -220,6 +236,62 @@ summary, the Studio panel label set.
   MLX deps are installed (Mac-only). On non-Mac hosts the import will fail
   per-file and be logged.
 
+## M4A → MP3 conversion specifics (manual audio ingest)
+
+- Lets the user drop arbitrary `.m4a` files (e.g. from Voice Memos) into
+  `OUTPUT_DIR` and have them join the pipeline. Runs as the first
+  post-scrape pass in `scraper.py`; also standalone via `uv run convert.py`.
+- **Idempotency hinges on the output filename being a hash of the input
+  bytes** (`md5(m4a-bytes).mp3`, streamed read in 1 MiB chunks). On every
+  run we re-hash each `.m4a`, check for an existing `<hash>.mp3`, and skip
+  if it's already there. This means the source `.m4a` can stay in the
+  folder indefinitely without ever re-encoding, and renaming the m4a
+  doesn't trigger a re-encode either (same bytes → same hash → skip). To
+  force a fresh encode, use `--force`.
+- The original `.m4a` is **never deleted or renamed**. The user can clean
+  up by hand once they're satisfied with the MP3.
+- Encoder: `ffmpeg -vn -c:a libmp3lame -q:a $MP3_QUALITY` (VBR, default
+  q=2 ≈ 190 kbps). `-vn` drops any embedded artwork/video stream that
+  Voice Memos and the like sometimes carry.
+- We write to `.<hash>.mp3.partial` first, then `Path.replace()` (atomic
+  rename) to the final name — a crash mid-encode cannot leave a corrupt
+  `<hash>.mp3` that the idempotency check would later treat as finished.
+- Fails loudly if `ffmpeg` isn't on PATH (`shutil.which("ffmpeg")`); does
+  not silently fall back to anything. macOS install: `brew install ffmpeg`.
+- Once the `.mp3` lands, the downstream passes pick it up by their normal
+  scan rules — no special-casing needed for "this MP3 came from an M4A".
+
+## Summarisation specifics (manual MP3 ingest)
+
+- Lets the user drop an arbitrary `<basename>.mp3` into `OUTPUT_DIR` and
+  still get a proper feed entry. Triggered automatically by `scraper.py`
+  between the transcribe and cover-art passes; also runnable standalone
+  via `uv run summarize.py`.
+- Acts only on MP3s that **lack** a `<basename>.json`. Scraper-downloaded
+  episodes already have one, so the pass is a no-op for them.
+- Needs a matching `<basename>.vtt` next to the MP3 — if it's missing
+  (transcription hasn't run yet or failed), the file is skipped with a
+  warning. Run transcribe.py first.
+- VTT → plain text via `_vtt_to_text()`: drops the `WEBVTT` header,
+  numeric cue ids, and `HH:MM:SS.mmm --> ...` timestamp lines, then joins
+  remaining lines into paragraphs separated by the original blank lines.
+- Sends the (truncated at 60k chars) transcript to Ollama's
+  `POST /api/generate` with `format: "json"` and a low temperature (0.3).
+  We **do not stream** the response (it's a single text completion, not
+  long-running like image gen). The model returns a JSON object with
+  `title` and `description`; both are validated to be non-empty before
+  we write the sidecar.
+- The written JSON mirrors `save_episode()`'s shape: `id`, `title`,
+  `description`, `audio_file`, `pub_date`, plus null `notebook_*` fields
+  and `"source": "manual"` so it's easy to spot manual entries. `id` is
+  `md5(filename)` (same scheme the cloud app uses for synthesised GUIDs
+  on bare MP3s — keeps the feed GUID stable when the sidecar is added).
+- `pub_date` comes from the MP3's mtime, so dropping an old file in won't
+  pretend it's brand new.
+- Title is formatted as `"<TITLE_PREFIX> - <topic>"` to match the rest of
+  the feed; if the model already prepended the prefix we strip it before
+  prepending again.
+
 ## Cover-art specifics
 
 - Runs after the transcription pass in `scraper.py` (and on demand via
@@ -296,7 +368,7 @@ summary, the Studio panel label set.
 
 ```bash
 # Sanity-check Python compiles after edits
-uv --project local run python -m py_compile local/scraper.py local/transcribe.py local/coverart.py
+uv --project local run python -m py_compile local/scraper.py local/convert.py local/transcribe.py local/summarize.py local/coverart.py
 uv --project cloud run python -m py_compile cloud/app.py
 
 # Confirm the Ollama host is reachable and the image model is installed
