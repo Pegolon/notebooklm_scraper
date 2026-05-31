@@ -53,6 +53,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 | [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware) + `GET /transcripts/{name}` + `GET /images/{name}`. Reads files directly from `OUTPUT_DIR`. |
 | [cloud/pyproject.toml](cloud/pyproject.toml) | Deps: `fastapi`, `uvicorn[standard]`, `python-dotenv`. |
 | [cloud/.env.example](cloud/.env.example) | Cloud-side config template. |
+| [orchestrate.py](orchestrate.py) | Top-level asyncio supervisor. Spawns `cloud/app.py` (long-running, restarted on crash) and `local/scraper.py` (once at startup, then every `SCRAPE_INTERVAL_S`, default 3600s). Stdlib-only, no root pyproject. Both children are launched via `uv run …` in their own subdirs so each picks up its own `.env`. Signal-handled (SIGINT/SIGTERM → SIGTERM children, 10s grace, SIGKILL). |
 
 ### Common commands
 
@@ -81,6 +82,10 @@ uv run coverart.py --force             # regenerate everything
 cd cloud
 uv sync
 uv run uvicorn app:app --host 0.0.0.0 --port 8000
+
+# both halves together (Mac Mini single-host deploy)
+python3 orchestrate.py                 # stdlib only; no root pyproject
+CLOUD_PORT=8080 SCRAPE_INTERVAL_S=1800 python3 orchestrate.py
 ```
 
 ## Configuration (`.env` per subdir)
@@ -400,6 +405,37 @@ summary, the Studio panel label set.
 - Behind a reverse proxy: pass through `Range`, `If-None-Match`,
   `If-Modified-Since`. The app sets `ETag`, `Last-Modified`,
   `Cache-Control` on audio and transcript responses.
+
+## Top-level orchestrator specifics
+
+- [orchestrate.py](orchestrate.py) is stdlib-only on purpose — it must
+  run from the repo root with nothing more than `python3 orchestrate.py`,
+  no `uv sync`, no root `pyproject.toml`, no root `.env`. Configuration
+  is via plain environment variables (`SCRAPE_INTERVAL_S`, `CLOUD_HOST`,
+  `CLOUD_PORT`, `CLOUD_RESTART_DELAY_S`).
+- Both children are spawned as `uv run …` subprocesses with their `cwd`
+  set to `local/` and `cloud/` respectively. That is what makes each
+  subdir's `.env` load correctly — do NOT rewrite this to import scraper
+  / app as Python modules, that would defeat the per-subdir env isolation
+  and force the orchestrator to depend on both projects' uv envs.
+- Two supervisor coroutines: `run_cloud()` (restart-on-crash loop with
+  `CLOUD_RESTART_DELAY_S` backoff) and `run_scraper()` (run-once then
+  sleep `SCRAPE_INTERVAL_S`, strictly sequential — the timer doesn't
+  start until the previous scrape returns, so even a multi-hour scrape
+  can never overlap itself).
+- Each child's stdout/stderr is drained line-by-line into the
+  orchestrator's stdout, prefixed `[cloud]` / `[scraper]`. Don't switch
+  to `subprocess.DEVNULL` or unread pipes — the kernel pipe buffer fills
+  and the child blocks on write.
+- Shutdown path: SIGINT/SIGTERM → set asyncio `Event` → both supervisors
+  break their loops → `_terminate()` sends SIGTERM, waits up to 10s,
+  then SIGKILL. If the orchestrator is itself killed with SIGKILL the
+  children become orphans owned by init/launchd — there is no
+  process-group setsid trick in place, deliberately, because launchd
+  handles cleanup of the whole job tree anyway.
+- If either supervisor task raises, the orchestrator exits non-zero so
+  the surrounding process manager (launchd `KeepAlive`, systemd
+  `Restart=on-failure`) can restart the whole tree clean.
 
 ## Git setup
 

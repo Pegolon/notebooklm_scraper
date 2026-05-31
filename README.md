@@ -34,7 +34,8 @@ personal podcast RSS feed with transcripts:
 
 Both halves are independent uv-managed Python 3.14 projects. Each has its
 own `pyproject.toml`, `.env.example`, and `README.md`. Deploy them
-separately.
+separately, or run them together via the top-level orchestrator
+(see [Running both halves together](#running-both-halves-together)).
 
 ## Quick start
 
@@ -69,6 +70,54 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8000
 Subscribe podcast clients to `${FEED_BASE_URL}/feed.xml`. See
 [cloud/README.md](cloud/README.md) for endpoint details and reverse-proxy
 notes.
+
+## Running both halves together
+
+When both halves live on the same host (typical Mac Mini setup where the
+cloud app is exposed via Tailscale Serve or Cloudflare Tunnel), the
+top-level [orchestrate.py](orchestrate.py) supervises both as one process
+tree using stdlib `asyncio` — no extra dependencies, no root `.env`:
+
+```bash
+python3 orchestrate.py
+```
+
+- Starts the cloud FastAPI/uvicorn server and keeps it running, restarting
+  it on crash with a short backoff.
+- Runs `scraper.py` once at startup, then again every
+  `SCRAPE_INTERVAL_S` seconds (default `3600`, i.e. once an hour).
+  Sequential only — a slow scrape never overlaps with the next one.
+- Merges both children's logs into one stream, prefixed `[cloud]` /
+  `[scraper]`, so launchd/systemd just sees one stdout.
+- SIGINT/SIGTERM cleanly terminates both children (10 s grace, then
+  SIGKILL).
+
+Both children are spawned via `uv run …` inside `local/` and `cloud/`
+respectively, so each picks up its own `.env` exactly as if you'd run it
+by hand. Optional environment knobs (read from the orchestrator's own
+environment — there is intentionally no root `.env`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SCRAPE_INTERVAL_S` | `3600` | Seconds between scraper runs |
+| `CLOUD_HOST` | `0.0.0.0` | uvicorn bind host |
+| `CLOUD_PORT` | `8000` | uvicorn bind port |
+| `CLOUD_RESTART_DELAY_S` | `5` | Backoff before restarting the cloud app after a crash |
+
+Example launchd plist snippet (writes combined logs to a single file):
+
+```xml
+<key>ProgramArguments</key>
+<array>
+  <string>/usr/bin/python3</string>
+  <string>/Users/you/notebooklm_scraper/orchestrate.py</string>
+</array>
+<key>WorkingDirectory</key>
+<string>/Users/you/notebooklm_scraper</string>
+<key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>/Users/you/notebooklm_scraper/orchestrate.log</string>
+<key>StandardErrorPath</key><string>/Users/you/notebooklm_scraper/orchestrate.log</string>
+```
 
 ## Configuration shared between halves
 
