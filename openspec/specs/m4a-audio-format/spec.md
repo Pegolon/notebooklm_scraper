@@ -88,7 +88,7 @@ The cloud app's RSS feed builder SHALL set the enclosure `type` attribute to `au
 ---
 
 ### Requirement: Cloud app serves M4A audio files
-The cloud app's `/audio/{filename}` endpoint SHALL accept filenames with `.m4a` suffix and serve them with `Content-Type: audio/x-m4a`. The endpoint SHALL retain full HTTP Range support (single-range requests, 206 Partial Content, ETag, Last-Modified, Cache-Control).
+The cloud app's `/audio/{filename}` endpoint SHALL accept filenames with `.m4a` suffix and serve them with `Content-Type: audio/x-m4a`. The endpoint SHALL retain full HTTP Range support (single-range requests, 206 Partial Content, ETag, Last-Modified, Cache-Control). The file streaming SHALL be performed asynchronously and non-blockingly, reading the file in chunks of a configured size (e.g., 64 KB or 128 KB).
 
 #### Scenario: Serve M4A with Range support
 - **WHEN** a client requests `GET /audio/<hash>.m4a` with a `Range: bytes=0-1023` header
@@ -109,8 +109,6 @@ The cloud app's `/audio/{filename}` endpoint SHALL accept filenames with `.m4a` 
 #### Scenario: Path safety rejects non-M4A suffix
 - **WHEN** a client requests `/audio/file.mp3`
 - **THEN** the endpoint SHALL return `404 Not Found`
-
----
 
 ### Requirement: Cloud app discovers episodes via M4A scan
 The cloud app's `load_episodes()` function SHALL iterate `*.m4a` files in OUTPUT_DIR (instead of `*.mp3`). Bare M4A files without a JSON sidecar SHALL still be discovered and have metadata synthesized from filename and mtime.
