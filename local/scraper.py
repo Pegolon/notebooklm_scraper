@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -75,6 +76,7 @@ HOME_URL = "https://notebooklm.google.com/"
 
 NAV_TIMEOUT_MS = 60_000
 UI_TIMEOUT_MS = 20_000
+GENERATION_TIMEOUT_S = int(os.environ.get("GENERATION_TIMEOUT_S", "900"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -786,13 +788,51 @@ def download_audio_overview(page: Page) -> Download:
     except Exception:
         pass
 
+    # Wait for the generation to complete if the audio overview is currently being created.
+    # Generation can take several minutes. We check if the kebab button is present and enabled.
+    start_time = time.time()
+    poll_interval = 15
+    last_log_time = 0.0
+
+    while True:
+        buttons = row.locator("button")
+        n = buttons.count()
+
+        # We need at least two buttons (usually 4: body, interactive, play, kebab)
+        # and the kebab button (nth(n-1)) must be enabled (not disabled).
+        is_ready = False
+        if n >= 2:
+            kebab = buttons.nth(n - 1)
+            try:
+                if not kebab.is_disabled():
+                    is_ready = True
+            except Exception:
+                pass
+
+        if is_ready:
+            break
+
+        elapsed = time.time() - start_time
+        if elapsed > GENERATION_TIMEOUT_S:
+            raise RuntimeError(
+                f"Audio overview generation timed out after {GENERATION_TIMEOUT_S} seconds. "
+                f"Currently has {n} button(s)."
+            )
+
+        if time.time() - last_log_time >= 30.0:
+            log.info(
+                "Audio overview is currently generating/loading (has %d button(s)). "
+                "Waiting for it to complete... (elapsed: %d/%d seconds)",
+                n, int(elapsed), GENERATION_TIMEOUT_S
+            )
+            last_log_time = time.time()
+
+        page.wait_for_timeout(poll_interval * 1000)
+
+    # Now that we know the kebab button is present and enabled, proceed
     buttons = row.locator("button")
     n = buttons.count()
-    if n == 0:
-        raise RuntimeError("Audio overview row has no buttons.")
-    log.info("Audio overview row has %d button(s); clicking the last (kebab).", n)
-
-    # Click the kebab (rightmost button) to open the action menu.
+    log.info("Audio overview row is ready with %d button(s); clicking the last (kebab).", n)
     kebab = buttons.nth(n - 1)
     kebab.click(timeout=5_000)
     page.wait_for_timeout(300)  # let the popover render
