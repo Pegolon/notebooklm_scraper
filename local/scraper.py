@@ -884,7 +884,7 @@ def save_episode(
     title_part = notebook_title.strip() or now.strftime("%Y-%m-%d")
     metadata = {
         "id": ep_hash,
-        "title": f"{TITLE_PREFIX} - {title_part}",
+        "title": title_part,
         "description": description,
         "audio_file": f"{ep_hash}.mp3",
         "pub_date": now.isoformat(),
