@@ -97,6 +97,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("cloud")
 
+# Feed in-memory caching state
+import threading
+
+_feed_cache: Optional[str] = None
+_feed_cache_mtime: float = 0.0
+_feed_cache_file_count: int = -1
+_feed_cache_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Episode discovery (same shape as the old feed.py)
@@ -387,15 +395,49 @@ def serve_feed(request: Request) -> Response:
         raise HTTPException(status_code=500, detail="FEED_BASE_URL is not configured.")
     if not OUTPUT_DIR.exists():
         raise HTTPException(status_code=500, detail=f"OUTPUT_DIR does not exist: {OUTPUT_DIR}")
-    episodes = load_episodes(OUTPUT_DIR)
-    xml = build_feed(episodes, FEED_BASE_URL)
+
+    global _feed_cache, _feed_cache_mtime, _feed_cache_file_count
+
+    try:
+        current_mtime = OUTPUT_DIR.stat().st_mtime
+        current_file_count = sum(1 for p in OUTPUT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".m4a")
+    except Exception as e:
+        log.error("Failed to read directory state of %s: %s. Rebuilding feed dynamically.", OUTPUT_DIR, e)
+        episodes = load_episodes(OUTPUT_DIR)
+        xml = build_feed(episodes, FEED_BASE_URL)
+        body = b"" if request.method == "HEAD" else xml.encode("utf-8")
+        return Response(
+            content=body,
+            media_type="application/rss+xml; charset=utf-8",
+            headers={
+                "Cache-Control": "public, max-age=60",
+                "Content-Length": str(len(body)),
+            },
+        )
+
+    with _feed_cache_lock:
+        if (
+            _feed_cache is None
+            or _feed_cache_mtime != current_mtime
+            or _feed_cache_file_count != current_file_count
+        ):
+            log.info("Feed cache stale or uninitialized. Rebuilding feed...")
+            episodes = load_episodes(OUTPUT_DIR)
+            _feed_cache = build_feed(episodes, FEED_BASE_URL)
+            _feed_cache_mtime = current_mtime
+            _feed_cache_file_count = current_file_count
+        else:
+            log.info("Serving feed from cache.")
+
+        xml = _feed_cache
+
     body = b"" if request.method == "HEAD" else xml.encode("utf-8")
     return Response(
         content=body,
         media_type="application/rss+xml; charset=utf-8",
         headers={
             "Cache-Control": "public, max-age=60",
-            "Content-Length": str(len(xml.encode("utf-8"))),
+            "Content-Length": str(len(body)),
         },
     )
 
