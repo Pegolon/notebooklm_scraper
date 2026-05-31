@@ -34,6 +34,7 @@ Stop:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import os
 import signal
@@ -66,9 +67,12 @@ async def _pipe_to_log(stream: asyncio.StreamReader | None, prefix: str) -> None
         line = await stream.readline()
         if not line:
             return
-        # Children already format their own log lines; just tag them so the
-        # combined stream is readable.
-        sys.stdout.write(f"[{prefix}] {line.decode(errors='replace')}")
+        # Generate timestamp matching orchestrator formatting
+        now = datetime.datetime.now()
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        # Children already format their own log lines; prepend the timestamp and tag them
+        # so the combined stream is readable.
+        sys.stdout.write(f"{timestamp} [{prefix}] {line.decode(errors='replace')}")
         sys.stdout.flush()
 
 
