@@ -149,6 +149,8 @@ def load_episodes(output_dir: Path) -> list[dict]:
         meta["_transcript_file"] = vtt.name if vtt.exists() else None
         png = m4a.with_suffix(".png")
         meta["_image_file"] = png.name if png.exists() else None
+        chapters = m4a.with_suffix(".chaptermarks.txt")
+        meta["_chapters_file"] = f"{m4a.stem}.json" if chapters.exists() else None
         out.append(meta)
     out.sort(key=lambda m: m.get("pub_date") or "", reverse=True)
     return out
@@ -225,6 +227,13 @@ def build_feed(episodes: list[dict], base_url: str) -> str:
             transcript.set("url", f"{base_url}/transcripts/{ep['_transcript_file']}")
             transcript.set("type", "text/vtt")
             transcript.set("lang", FEED_LANGUAGE.split("-")[0] or "en")
+
+        # Podcasting 2.0 chapters tag — points clients at the chapters JSON
+        # endpoint (parsed from <basename>.chaptermarks.txt).
+        if ep.get("_chapters_file"):
+            chapters_el = ET.SubElement(item, f"{{{PODCAST_NS}}}chapters")
+            chapters_el.set("url", f"{base_url}/chapters/{ep['_chapters_file']}")
+            chapters_el.set("type", "application/json+chapters")
 
         # Per-episode cover art (written by local/coverart.py). Falls back to
         # the channel-level FEED_IMAGE_URL in clients that don't see an
@@ -328,7 +337,7 @@ def is_legitimate_route(path: str) -> bool:
     """Check if the path matches one of our defined endpoints to prevent false positives."""
     if path in ("/", "/feed.xml"):
         return True
-    for prefix in ("/audio/", "/images/", "/transcripts/"):
+    for prefix in ("/audio/", "/images/", "/transcripts/", "/chapters/"):
         if path.startswith(prefix):
             return True
     return False
@@ -401,8 +410,27 @@ def serve_feed(request: Request) -> Response:
     global _feed_cache, _feed_cache_mtime, _feed_cache_file_count
 
     try:
-        current_mtime = OUTPUT_DIR.stat().st_mtime
-        current_file_count = sum(1 for p in OUTPUT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".m4a")
+        dir_mtime = OUTPUT_DIR.stat().st_mtime
+        m4a_count = 0
+        chaptermarks_count = 0
+        max_file_mtime = dir_mtime
+        for p in OUTPUT_DIR.iterdir():
+            if p.is_file():
+                ext = p.suffix.lower()
+                if ext == ".m4a":
+                    m4a_count += 1
+                    try:
+                        max_file_mtime = max(max_file_mtime, p.stat().st_mtime)
+                    except Exception:
+                        pass
+                elif p.name.lower().endswith(".chaptermarks.txt"):
+                    chaptermarks_count += 1
+                    try:
+                        max_file_mtime = max(max_file_mtime, p.stat().st_mtime)
+                    except Exception:
+                        pass
+        current_mtime = max_file_mtime
+        current_file_count = m4a_count + chaptermarks_count
     except Exception as e:
         log.error("Failed to read directory state of %s: %s. Rebuilding feed dynamically.", OUTPUT_DIR, e)
         episodes = load_episodes(OUTPUT_DIR)
@@ -567,4 +595,109 @@ def serve_transcript(filename: str, request: Request) -> Response:
         content=body,
         media_type="text/vtt; charset=utf-8",
         headers=headers,
+    )
+
+
+# ---------------------------------------------------------------------------
+# FFMETADATA1 chapters parsing & endpoint
+# ---------------------------------------------------------------------------
+
+def _unescape_metadata_val(val: str) -> str:
+    """Decode backslash-escaped characters in FFMETADATA1 files."""
+    res = []
+    i = 0
+    while i < len(val):
+        if val[i] == '\\' and i + 1 < len(val):
+            next_char = val[i+1]
+            if next_char == 'n':
+                res.append('\n')
+            else:
+                res.append(next_char)
+            i += 2
+        else:
+            res.append(val[i])
+            i += 1
+    return "".join(res)
+
+
+def _parse_chaptermarks(path: Path) -> dict:
+    """Parse an FFMETADATA1 formatted file into a Podcasting 2.0 chapters dict."""
+    chapters = []
+    current_chapter = {}
+
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        log.error("Failed to read chapter marks file %s: %s", path.name, e)
+        raise HTTPException(status_code=404, detail="Chapter marks file is unreadable.")
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";") or line.startswith("#"):
+            continue
+        if line == "[CHAPTER]":
+            if current_chapter and "start_ms" in current_chapter and "title" in current_chapter:
+                chapters.append(current_chapter)
+            current_chapter = {}
+            continue
+
+        if "=" in line:
+            parts = line.split("=", 1)
+            key = parts[0].strip().upper()
+            val = parts[1].strip()
+            if key == "START":
+                try:
+                    current_chapter["start_ms"] = int(val)
+                except ValueError:
+                    pass
+            elif key == "TITLE":
+                current_chapter["title"] = _unescape_metadata_val(val)
+
+    # Append the last chapter
+    if current_chapter and "start_ms" in current_chapter and "title" in current_chapter:
+        chapters.append(current_chapter)
+
+    # Format into Podcast Chapters JSON format (version 1.2)
+    # startTime in seconds (float)
+    formatted_chapters = []
+    for ch in chapters:
+        start_sec = round(ch["start_ms"] / 1000.0, 3)
+        formatted_chapters.append({
+            "startTime": start_sec,
+            "title": ch["title"]
+        })
+
+    # Sort just in case they are out of order
+    formatted_chapters.sort(key=lambda x: x["startTime"])
+
+    return {
+        "version": "1.2",
+        "chapters": formatted_chapters
+    }
+
+
+@app.api_route("/chapters/{filename}", methods=["GET", "HEAD"])
+def serve_chapters(filename: str, request: Request) -> Response:
+    """Serve a Podcast Chapters JSON file parsed from the .chaptermarks.txt sidecar.
+
+    Referenced by the feed's <podcast:chapters> tag.
+    """
+    if not filename.lower().endswith(".json"):
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    stem = Path(filename).stem
+    chaptermarks_filename = f"{stem}.chaptermarks.txt"
+    path = _safe_resolve(chaptermarks_filename, ".chaptermarks.txt")
+
+    chapters_data = _parse_chaptermarks(path)
+    json_bytes = json.dumps(chapters_data, indent=2).encode("utf-8")
+    body = b"" if request.method == "HEAD" else json_bytes
+
+    return Response(
+        content=body,
+        media_type="application/json+chapters; charset=utf-8",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "Content-Length": str(len(json_bytes)),
+        }
     )
