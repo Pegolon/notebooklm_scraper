@@ -5,19 +5,19 @@ personal podcast RSS feed with transcripts:
 
 - [**local/**](local/) — Mac Mini side. Playwright scraper, on-device
   MLX-Whisper transcriber, and Ollama-driven cover-art generator. Writes
-  `<hash>.mp3` / `.json` / `.vtt` / `.png` quartets into a
+  `<hash>.m4a` / `.json` / `.vtt` / `.png` quartets into a
   Google-Drive-synced folder (`OUTPUT_DIR`).
 - [**cloud/**](cloud/) — Wherever you can publish. FastAPI app that reads
   the same folder (synced down to the cloud box via Google Drive), generates
-  the RSS feed on the fly, streams MP3s to podcast clients with HTTP
+  the RSS feed on the fly, streams M4As to podcast clients with HTTP
   Range support, and serves WebVTT transcripts via the Podcasting 2.0
   `<podcast:transcript>` tag.
 
 ```diagram
 ╭─ Mac Mini ─────────────────────╮      ╭─ Cloud / VPS ──────────────────────────╮
 │ local/scraper.py               │      │ cloud/app.py  (FastAPI / uvicorn)      │
-│   → MP3 + JSON sidecar         │      │   GET /feed.xml         →  RSS XML     │
-│ local/transcribe.py            │      │   GET /audio/<n>        →  MP3 (Range) │
+│   → M4A + JSON sidecar         │      │   GET /feed.xml         →  RSS XML     │
+│ local/transcribe.py            │      │   GET /audio/<n>        →  M4A (Range) │
 │   → <name>.vtt                 │      │   GET /transcripts/<n>  →  WebVTT      │
 │ local/coverart.py              │      ╰──────────────┬─────────────────────────╯
 │   → <name>.png                 │                     │
@@ -25,10 +25,10 @@ personal podcast RSS feed with transcripts:
            ▼ writes into                               │
     ╭────────────────────────────╮  ◀─── same folder ──╯
     │ OUTPUT_DIR (Google Drive)  │
-    │   ↳ <hash>.mp3             │
+    │   ↳ <hash>.m4a             │
     │   ↳ <hash>.json            │
     │   ↳ <hash>.vtt             │
-    │   ↳ <hash>.png             │   (manual MP3 drops also work)
+    │   ↳ <hash>.png             │   (manual M4A / MP3 drops also work)
     ╰────────────────────────────╯
 ```
 
@@ -130,7 +130,7 @@ local, RSS metadata on cloud) is one-sided.
 
 Each scraped episode produces this set of sibling files in `OUTPUT_DIR`:
 
-- **`<hash>.mp3`** — the Audio Overview download.
+- **`<hash>.m4a`** — the Audio Overview download.
 - **`<hash>.json`** — metadata: title, description, pub_date, source notebook id/URL.
 - **`<hash>.vtt`** — WebVTT transcript (added by the transcribe pass).
 - **`<hash>.png`** — cover art themed by the description (added by the cover-art pass).
@@ -138,7 +138,7 @@ Each scraped episode produces this set of sibling files in `OUTPUT_DIR`:
 `<hash>` is `md5(normalized_description)` so regeneration of the same
 NotebookLM content is idempotent.
 
-If a bare `.mp3` is dropped into `OUTPUT_DIR` with no sidecar JSON, the
+If a bare `.m4a` or `.mp3` is dropped into `OUTPUT_DIR` with no sidecar JSON, the
 cloud feed synthesises a minimal episode from the filename + mtime so the
 file still shows up.
 

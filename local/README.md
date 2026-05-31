@@ -17,12 +17,12 @@ uv run scraper.py --login              # one-time, headful, sign into Google
 uv run scraper.py                      # main entry point (cron / launchd)
 uv run scraper.py --list               # debug: list visible notebooks (with emojis)
 uv run scraper.py --url <NOTEBOOK_URL> # force a specific notebook
-uv run transcribe.py                   # transcribe any MP3 missing a .vtt
-uv run transcribe.py --file foo.mp3    # transcribe one file
-uv run chapters.py                     # generate chapter marks for any MP3 missing .chaptermarks.txt
-uv run chapters.py --file foo.mp3      # generate chapter marks for one file
-uv run coverart.py                     # render cover PNGs for any MP3 missing one
-uv run coverart.py --file foo.mp3      # render one cover
+uv run transcribe.py                   # transcribe any M4A missing a .vtt
+uv run transcribe.py --file foo.m4a    # transcribe one file
+uv run chapters.py                     # generate chapter marks for any M4A missing .chaptermarks.txt
+uv run chapters.py --file foo.m4a      # generate chapter marks for one file
+uv run coverart.py                     # render cover PNGs for any M4A missing one
+uv run coverart.py --file foo.m4a      # render one cover
 uv run coverart.py --force             # regenerate every cover
 ```
 
@@ -33,7 +33,7 @@ on top of a per-episode gradient circle (the gradient hues are derived
 from a stable hash of the episode title, so each cover is distinct but
 reproducible). The emoji is whichever icon NotebookLM auto-assigned to
 the notebook — `scraper.py` captures it from the home-page card and
-stores it in the JSON sidecar as `notebook_emoji`. Manually-dropped MP3s
+stores it in the JSON sidecar as `notebook_emoji`. Manually-dropped M4As/MP3s
 and `--url`-forced runs fall back to `COVER_DEFAULT_EMOJI` (🎙️ by default).
 
 Apple Color Emoji ships only as `sbix` bitmap tables, which ImageMagick /
