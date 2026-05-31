@@ -13,24 +13,81 @@ personal podcast RSS feed with transcripts:
   Range support, and serves WebVTT transcripts via the Podcasting 2.0
   `<podcast:transcript>` tag.
 
-```diagram
-╭─ Mac Mini ─────────────────────╮      ╭─ Cloud / VPS ──────────────────────────╮
-│ local/scraper.py               │      │ cloud/app.py  (FastAPI / uvicorn)      │
-│   → M4A + JSON sidecar         │      │   GET /feed.xml         →  RSS XML     │
-│ local/transcribe.py            │      │   GET /audio/<n>        →  M4A (Range) │
-│   → <name>.vtt                 │      │   GET /transcripts/<n>  →  WebVTT      │
-│ local/coverart.py              │      ╰──────────────┬─────────────────────────╯
-│   → <name>.png                 │                     │
-╰──────────┬─────────────────────╯                     │ reads
-           ▼ writes into                               │
-    ╭────────────────────────────╮  ◀─── same folder ──╯
-    │ OUTPUT_DIR (Google Drive)  │
-    │   ↳ <hash>.m4a             │
-    │   ↳ <hash>.json            │
-    │   ↳ <hash>.vtt             │
-    │   ↳ <hash>.png             │   (manual M4A / MP3 drops also work)
-    ╰────────────────────────────╯
+```mermaid
+flowchart TD
+    subgraph Mac ["💻 Mac Mini (Local Side)"]
+        direction TB
+        scraper["local/scraper.py<br/><i>(M4A + JSON sidecar)</i>"]
+        transcribe["local/transcribe.py<br/><i>(&lt;name&gt;.vtt)</i>"]
+        coverart["local/coverart.py<br/><i>(&lt;name&gt;.png)</i>"]
+    end
+
+    subgraph Drive ["📂 OUTPUT_DIR (Google Drive)"]
+        direction TB
+        files["&lt;hash&gt;.m4a<br/>&lt;hash&gt;.json<br/>&lt;hash&gt;.vtt<br/>&lt;hash&gt;.png"]
+        note["<i>(manual M4A / MP3 drops also work)</i>"]
+        files --- note
+    end
+
+    subgraph Cloud ["☁️ Cloud / VPS"]
+        direction TB
+        app["cloud/app.py (FastAPI / uvicorn)"]
+        feed["GET /feed.xml ➜ RSS XML"]
+        audio["GET /audio/&lt;n&gt; ➜ M4A (Range)"]
+        transcripts["GET /transcripts/&lt;n&gt; ➜ WebVTT"]
+        
+        app --- feed
+        app --- audio
+        app --- transcripts
+    end
+
+    scraper -->|"writes into"| Drive
+    transcribe -->|"writes into"| Drive
+    coverart -->|"writes into"| Drive
+
+    app -->|"reads from"| Drive
 ```
+
+## Technology Stack & Frameworks
+
+The pipeline is powered by a modern, high-performance Python stack:
+
+```mermaid
+flowchart TD
+    %% Styling
+    classDef tools fill:#e1f5fe,stroke:#0288d1,stroke-width:1.5px;
+    classDef local fill:#fff3e0,stroke:#f57c00,stroke-width:1.5px;
+    classDef cloud fill:#efebe9,stroke:#4d342e,stroke-width:1.5px;
+    
+    subgraph Env ["⚙️ Environment & Orchestration"]
+        uv["<b>Astral uv</b><br/>Python Project & Dependency Manager"]
+        python["<b>Python 3.14</b><br/>Execution Runtime"]
+        asyncio["<b>asyncio</b><br/>orchestrate.py Process Supervisor"]
+    end
+
+    subgraph Local ["💻 Local Pipeline (Mac Mini)"]
+        direction TB
+        playwright["<b>Playwright (Chromium)</b><br/>Browser automation & scraping"]
+        whisper["<b>mlx-whisper</b><br/>On-device Apple Silicon transcription"]
+        ollama["<b>Ollama (Qwen LLM)</b><br/>Chapter markers & summaries"]
+        pillow["<b>Pillow (PIL)</b><br/>Gradient cover art rendering"]
+        ffmpeg["<b>ffmpeg</b><br/>AAC encoding & chapter embedding"]
+        mutagen["<b>mutagen</b><br/>MP4/M4A metadata & ID3 tagging"]
+    end
+
+    subgraph Cloud ["☁️ Cloud Server"]
+        direction TB
+        fastapi["<b>FastAPI</b><br/>High-performance API framework"]
+        uvicorn["<b>Uvicorn</b><br/>ASGI web server"]
+        xml["<b>ElementTree</b><br/>Dynamic Podcast RSS generator"]
+    end
+
+    %% Apply Classes
+    class uv,python,asyncio tools;
+    class playwright,whisper,ollama,pillow,ffmpeg,mutagen local;
+    class fastapi,uvicorn,xml cloud;
+```
+
 
 Both halves are independent uv-managed Python 3.14 projects. Each has its
 own `pyproject.toml`, `.env.example`, and `README.md`. Deploy them
