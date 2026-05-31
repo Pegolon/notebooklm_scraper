@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate PNG cover art for MP3 files in OUTPUT_DIR.
+Generate PNG cover art for M4A files in OUTPUT_DIR.
 
-For every <basename>.mp3 without a matching <basename>.png we read the sibling
+For every <basename>.m4a without a matching <basename>.png we read the sibling
 <basename>.json, grab the ``notebook_emoji`` field that scraper.py captured
 from NotebookLM's auto-assigned notebook icon (falling back to
 ``COVER_DEFAULT_EMOJI`` when none is available), and render a 1400×1400 PNG
@@ -13,8 +13,8 @@ requires Pillow — ImageMagick + FreeType on macOS only sees the glyph
 outlines (you get a black silhouette). Pillow handles the bitmap directly
 when you pass ``embedded_color=True``, so we use it for the whole pipeline.
 
-  uv run coverart.py                  # generate covers for all MP3s missing one
-  uv run coverart.py --file foo.mp3   # generate cover for a single file
+  uv run coverart.py                  # generate covers for all M4As missing one
+  uv run coverart.py --file foo.m4a   # generate cover for a single file
   uv run coverart.py --force          # regenerate even if a .png already exists
 """
 
@@ -87,19 +87,19 @@ log = logging.getLogger("coverart")
 # Sidecar JSON → (emoji, seed)
 # ---------------------------------------------------------------------------
 
-def _load_metadata(mp3: Path) -> tuple[str, str]:
-    """Return (emoji, seed) for the given MP3.
+def _load_metadata(m4a: Path) -> tuple[str, str]:
+    """Return (emoji, seed) for the given M4A.
 
     ``emoji`` is what we render; we prefer the sidecar JSON's
     ``notebook_emoji`` (captured by scraper.py from NotebookLM's auto-icon)
-    and fall back to ``DEFAULT_EMOJI`` for anything else (manual MP3s,
+    and fall back to ``DEFAULT_EMOJI`` for anything else (manual M4As,
     legacy episodes, etc.).
 
     ``seed`` is what we hash to pick stable per-episode gradient hues — the
     title + emoji combination, or the filename if no JSON is present. Same
     inputs always produce the same colours, but each episode gets its own.
     """
-    json_path = mp3.with_suffix(".json")
+    json_path = m4a.with_suffix(".json")
     emoji = ""
     title = ""
     if json_path.exists():
@@ -109,7 +109,7 @@ def _load_metadata(mp3: Path) -> tuple[str, str]:
             title = (meta.get("title") or "").strip()
         except Exception as e:  # noqa: BLE001
             log.warning("Could not parse %s: %s", json_path.name, e)
-    return emoji or DEFAULT_EMOJI, (title or mp3.stem)
+    return emoji or DEFAULT_EMOJI, (title or m4a.stem)
 
 
 # ---------------------------------------------------------------------------
@@ -224,18 +224,18 @@ def _render_emoji(emoji: str, target_px: int) -> Image.Image:
 # Per-file driver
 # ---------------------------------------------------------------------------
 
-def generate_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
-    """Render <basename>.png next to mp3. Returns the PNG path or None when
+def generate_one(m4a: Path, *, force: bool = False) -> Optional[Path]:
+    """Render <basename>.png next to m4a. Returns the PNG path or None when
     a cover already exists and force=False."""
-    png_path = mp3.with_suffix(".png")
+    png_path = m4a.with_suffix(".png")
     if png_path.exists() and not force:
-        log.info("Cover already exists for %s; skipping.", mp3.name)
+        log.info("Cover already exists for %s; skipping.", m4a.name)
         return None
 
-    emoji, seed = _load_metadata(mp3)
+    emoji, seed = _load_metadata(m4a)
     log.info(
         "Rendering cover for %s (emoji=%r, %d×%d)...",
-        mp3.name, emoji, COVER_SIZE, COVER_SIZE,
+        m4a.name, emoji, COVER_SIZE, COVER_SIZE,
     )
 
     h1, h2 = _stable_hues(seed)
@@ -263,25 +263,25 @@ def generate_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
 
 
 def cover_missing(output_dir: Path) -> tuple[int, int]:
-    """Find every *.mp3 in output_dir lacking a matching *.png and render one.
+    """Find every *.m4a in output_dir lacking a matching *.png and render one.
     Returns (successes, failures)."""
     missing = sorted(
-        mp3 for mp3 in output_dir.glob("*.mp3")
-        if not mp3.with_suffix(".png").exists()
+        m4a for m4a in output_dir.glob("*.m4a")
+        if not m4a.with_suffix(".png").exists()
     )
     if not missing:
-        log.info("Cover-art pass: all MP3s already have a .png — nothing to do.")
+        log.info("Cover-art pass: all M4As already have a .png — nothing to do.")
         return 0, 0
 
-    log.info("Cover-art pass: %d MP3 file(s) missing a cover.", len(missing))
+    log.info("Cover-art pass: %d M4A file(s) missing a cover.", len(missing))
     successes, failures = 0, 0
-    for mp3 in missing:
+    for m4a in missing:
         try:
-            generate_one(mp3)
+            generate_one(m4a)
             successes += 1
         except Exception as e:  # noqa: BLE001
             failures += 1
-            log.error("Failed to generate cover for %s: %s", mp3.name, e)
+            log.error("Failed to generate cover for %s: %s", m4a.name, e)
             # Keep going so a single bad file doesn't block the rest.
     log.info("Cover-art pass done. %d succeeded, %d failed.", successes, failures)
     return successes, failures
@@ -299,11 +299,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--file", type=str, default=None,
-        help="Generate a cover for one specific MP3 file (path) instead of scanning OUTPUT_DIR.",
+        help="Generate a cover for one specific M4A file (path) instead of scanning OUTPUT_DIR.",
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Regenerate the cover even if a .png already exists next to the MP3.",
+        help="Regenerate the cover even if a .png already exists next to the M4A.",
     )
     args = parser.parse_args()
 
@@ -311,16 +311,16 @@ def main() -> int:
     assert OUTPUT_DIR is not None
 
     if args.file:
-        mp3 = Path(args.file).expanduser().resolve()
-        if not mp3.exists() or mp3.suffix.lower() != ".mp3":
-            log.error("Not an existing .mp3 file: %s", mp3)
+        m4a = Path(args.file).expanduser().resolve()
+        if not m4a.exists() or m4a.suffix.lower() != ".m4a":
+            log.error("Not an existing .m4a file: %s", m4a)
             return 2
-        generate_one(mp3, force=args.force)
+        generate_one(m4a, force=args.force)
     else:
         if args.force:
             # Honor --force in bulk mode by deleting existing .pngs first.
-            for mp3 in OUTPUT_DIR.glob("*.mp3"):
-                png = mp3.with_suffix(".png")
+            for m4a in OUTPUT_DIR.glob("*.m4a"):
+                png = m4a.with_suffix(".png")
                 if png.exists():
                     png.unlink()
         cover_missing(OUTPUT_DIR)

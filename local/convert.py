@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Convert M4A audio files in OUTPUT_DIR to MP3, using the MD5 of the original
-M4A bytes as the filename so the conversion is fully idempotent.
+Convert MP3 audio files in OUTPUT_DIR to M4A (AAC in MP4/ISO container), using
+the MD5 of the original MP3 bytes as the filename so the conversion is fully idempotent.
 
-For every <name>.m4a in OUTPUT_DIR, compute md5(file-bytes); if a sibling
-<hash>.mp3 already exists, skip (already converted in a previous run);
-otherwise transcode via ffmpeg into <hash>.mp3 alongside the rest of the
-episodes. The original M4A is left untouched — delete it manually once
+For every <name>.mp3 in OUTPUT_DIR, compute md5(file-bytes); if a sibling
+<hash>.m4a already exists, skip (already converted in a previous run);
+otherwise transcode via ffmpeg into <hash>.m4a alongside the rest of the
+episodes. The original MP3 is left untouched — delete it manually once
 you're happy with the conversion.
 
-This is the first pass in the manual-audio pipeline; once the MP3 lands in
+This is the first pass in the manual-audio pipeline; once the M4A lands in
 the folder, the rest of the chain (transcribe → summarise → coverart)
 picks it up by its normal scan rules:
 
-  convert (m4a → <hash>.mp3) → transcribe → summarise → coverart
+  convert (mp3 → <hash>.m4a) → transcribe → summarise → coverart
 
-  uv run convert.py                  # convert all M4As not yet converted
-  uv run convert.py --file foo.m4a   # convert one specific file
-  uv run convert.py --force          # re-encode even if <hash>.mp3 exists
+  uv run convert.py                  # convert all MP3s not yet converted
+  uv run convert.py --file foo.mp3   # convert one specific file
+  uv run convert.py --force          # re-encode even if <hash>.m4a exists
 
 Requires ffmpeg on PATH. Install via `brew install ffmpeg` on macOS.
 """
@@ -53,11 +53,11 @@ OUTPUT_DIR = (
     else None
 )
 
-# libmp3lame VBR quality. q:a 2 ≈ 190 kbps avg — well above transparent for
-# voice content while staying compact. Override via .env if needed.
-MP3_QUALITY = os.environ.get("MP3_QUALITY", "2").strip()
+# AAC bitrate setting. 128k is transparent and standard for speech content.
+# Override via .env if needed.
+AAC_BITRATE = os.environ.get("AAC_BITRATE", "128k").strip()
 
-# Read buffer for hashing. 1 MiB is a good fit for spinning Drive-synced files.
+# Read buffer for hashing. 1 MiB is a good fit for streaming files.
 _HASH_CHUNK = 1024 * 1024
 
 logging.basicConfig(
@@ -77,14 +77,14 @@ def _hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def transcode_to_mp3(src: Path, dst: Path, *, quality: Optional[str] = None) -> Path:
-    """Transcode `src` (any audio container ffmpeg can read) to MP3 at `dst`.
+def transcode_to_m4a(src: Path, dst: Path, *, bitrate: Optional[str] = None) -> Path:
+    """Transcode `src` (any audio container ffmpeg can read) to M4A (AAC) at `dst`.
 
     Writes via a hidden `<dst>.partial` temp file and atomically renames on
     success — a crash mid-encode cannot leave a half-written file at `dst`.
     Returns `dst`. Raises RuntimeError on any ffmpeg failure.
 
-    Shared between the standalone convert pass (which names `dst` by the m4a
+    Shared between the standalone convert pass (which names `dst` by the mp3
     bytes hash) and the scraper (which preserves the description-based hash
     so the JSON sidecar's `audio_file` stays valid).
     """
@@ -94,7 +94,7 @@ def transcode_to_mp3(src: Path, dst: Path, *, quality: Optional[str] = None) -> 
             "and re-run."
         )
 
-    q = (quality or MP3_QUALITY).strip()
+    b = (bitrate or AAC_BITRATE).strip()
     tmp = dst.with_name(f".{dst.name}.partial")
     cmd = [
         "ffmpeg",
@@ -102,14 +102,12 @@ def transcode_to_mp3(src: Path, dst: Path, *, quality: Optional[str] = None) -> 
         "-loglevel", "error",       # quiet output; we only care about errors
         "-i", str(src),
         "-vn",                      # drop any embedded artwork/video stream
-        "-c:a", "libmp3lame",
-        "-q:a", q,
-        "-f", "mp3",                # force muxer (tmp filename ends in .partial,
-                                    # which would otherwise confuse ffmpeg's
-                                    # extension-based format detection)
+        "-c:a", "aac",
+        "-b:a", b,
+        "-f", "ipod",               # force iPod/M4A muxer
         str(tmp),
     ]
-    log.info("Transcoding %s → %s (libmp3lame VBR q=%s)...", src.name, dst.name, q)
+    log.info("Transcoding %s → %s (AAC CBR %s)...", src.name, dst.name, b)
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
@@ -118,7 +116,7 @@ def transcode_to_mp3(src: Path, dst: Path, *, quality: Optional[str] = None) -> 
         raise RuntimeError(
             f"ffmpeg failed on {src.name}: {(e.stderr or '').strip() or e}"
         ) from e
-    except FileNotFoundError as e:  # noqa: BLE001 — race: PATH lost ffmpeg between which() and run()
+    except FileNotFoundError as e:  # noqa: BLE001
         tmp.unlink(missing_ok=True)
         raise RuntimeError("ffmpeg disappeared from PATH mid-run.") from e
 
@@ -126,49 +124,47 @@ def transcode_to_mp3(src: Path, dst: Path, *, quality: Optional[str] = None) -> 
     return dst
 
 
-def convert_one(m4a: Path, *, output_dir: Path, force: bool = False) -> Optional[Path]:
-    """Convert one M4A to <hash>.mp3 in output_dir, where <hash> is the MD5
-    of the M4A bytes (so re-runs on the same input skip the work). Returns
-    the MP3 path, or None if the output already existed (and force=False).
+def convert_one(mp3: Path, *, output_dir: Path, force: bool = False) -> Optional[Path]:
+    """Convert one MP3 to <hash>.m4a in output_dir, where <hash> is the MD5
+    of the MP3 bytes (so re-runs on the same input skip the work). Returns
+    the M4A path, or None if the output already existed (and force=False).
     Raises on ffmpeg failure."""
-    size_mb = m4a.stat().st_size / 1024 / 1024
-    log.info("Hashing %s (%.1f MB)...", m4a.name, size_mb)
-    digest = _hash_file(m4a)
-    mp3 = output_dir / f"{digest}.mp3"
+    size_mb = mp3.stat().st_size / 1024 / 1024
+    log.info("Hashing %s (%.1f MB)...", mp3.name, size_mb)
+    digest = _hash_file(mp3)
+    m4a = output_dir / f"{digest}.m4a"
 
-    if mp3.exists() and not force:
-        log.info("%s already converted (%s); skipping.", m4a.name, mp3.name)
+    if m4a.exists() and not force:
+        log.info("%s already converted (%s); skipping.", mp3.name, m4a.name)
         return None
 
-    transcode_to_mp3(m4a, mp3)
-    out_size = mp3.stat().st_size
-    log.info("Wrote %s (%.1f KB).", mp3.name, out_size / 1024)
-    return mp3
+    transcode_to_m4a(mp3, m4a)
+    out_size = m4a.stat().st_size
+    log.info("Wrote %s (%.1f KB).", m4a.name, out_size / 1024)
+    return m4a
 
 
 def convert_missing(output_dir: Path) -> tuple[int, int]:
-    """Find every *.m4a in output_dir and convert it to <md5>.mp3 unless that
+    """Find every *.mp3 in output_dir and convert it to <md5>.m4a unless that
     output file already exists. Returns (successes, failures). Files that
     were already up-to-date count as neither success nor failure."""
-    # Case-insensitive glob: pick up .m4a and .M4A both.
-    m4as = sorted(
+    mp3s = sorted(
         p for p in output_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == ".m4a"
+        if p.is_file() and p.suffix.lower() == ".mp3"
     )
-    if not m4as:
-        log.info("Conversion pass: no .m4a files in %s — nothing to do.", output_dir)
+    if not mp3s:
+        log.info("Conversion pass: no .mp3 files in %s — nothing to do.", output_dir)
         return 0, 0
 
-    log.info("Conversion pass: %d .m4a file(s) found.", len(m4as))
+    log.info("Conversion pass: %d .mp3 file(s) found.", len(mp3s))
     successes, failures = 0, 0
-    for m4a in m4as:
+    for mp3 in mp3s:
         try:
-            convert_one(m4a, output_dir=output_dir)
+            convert_one(mp3, output_dir=output_dir)
             successes += 1
         except Exception as e:  # noqa: BLE001
             failures += 1
-            log.error("Failed to convert %s: %s", m4a.name, e)
-            # Keep going so a single bad file doesn't block the rest.
+            log.error("Failed to convert %s: %s", mp3.name, e)
     log.info("Conversion pass done. %d succeeded, %d failed.", successes, failures)
     return successes, failures
 
@@ -185,11 +181,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--file", type=str, default=None,
-        help="Convert one specific M4A file (path) instead of scanning OUTPUT_DIR.",
+        help="Convert one specific MP3 file (path) instead of scanning OUTPUT_DIR.",
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Re-encode even if <hash>.mp3 already exists.",
+        help="Re-encode even if <hash>.m4a already exists.",
     )
     args = parser.parse_args()
 
@@ -197,21 +193,18 @@ def main() -> int:
     assert OUTPUT_DIR is not None
 
     if args.file:
-        m4a = Path(args.file).expanduser().resolve()
-        if not m4a.exists() or m4a.suffix.lower() != ".m4a":
-            log.error("Not an existing .m4a file: %s", m4a)
+        mp3 = Path(args.file).expanduser().resolve()
+        if not mp3.exists() or mp3.suffix.lower() != ".mp3":
+            log.error("Not an existing .mp3 file: %s", mp3)
             return 2
-        convert_one(m4a, output_dir=OUTPUT_DIR, force=args.force)
+        convert_one(mp3, output_dir=OUTPUT_DIR, force=args.force)
     else:
         if args.force:
-            # In bulk mode, --force means: for every M4A, drop its <hash>.mp3
-            # first so the main loop will re-encode. We only delete files that
-            # we'd recreate — never any random .mp3 the user dropped in.
-            for m4a in OUTPUT_DIR.iterdir():
-                if m4a.is_file() and m4a.suffix.lower() == ".m4a":
-                    mp3 = OUTPUT_DIR / f"{_hash_file(m4a)}.mp3"
-                    if mp3.exists():
-                        mp3.unlink()
+            for mp3 in OUTPUT_DIR.iterdir():
+                if mp3.is_file() and mp3.suffix.lower() == ".mp3":
+                    m4a = OUTPUT_DIR / f"{_hash_file(mp3)}.m4a"
+                    if m4a.exists():
+                        m4a.unlink()
         convert_missing(OUTPUT_DIR)
     return 0
 

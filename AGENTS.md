@@ -21,17 +21,17 @@ audio over HTTPS.
 ```diagram
 ╭─ Mac Mini ─────────────────────╮      ╭─ Cloud / VPS ──────────────────────────╮
 │ local/scraper.py               │      │ cloud/app.py  (FastAPI / uvicorn)      │
-│   → MP3 + JSON sidecar         │      │   GET /feed.xml         →  RSS XML     │
-│ local/transcribe.py            │      │   GET /audio/<n>        →  MP3 (Range) │
+│   → M4A + JSON sidecar         │      │   GET /feed.xml         →  RSS XML     │
+│ local/transcribe.py            │      │   GET /audio/<n>        →  M4A (Range) │
 │   → <name>.vtt                 │      │   GET /transcripts/<n>  →  WebVTT      │
 │                                │      ╰──────────────┬─────────────────────────╯
 ╰──────────┬─────────────────────╯                     │ reads
            ▼ writes into                               │
     ╭────────────────────────────╮  ◀─── same folder ──╯
     │ OUTPUT_DIR (Google Drive)  │
-    │   ↳ <hash>.mp3             │
+    │   ↳ <hash>.m4a             │
     │   ↳ <hash>.json            │
-    │   ↳ <hash>.vtt             │   (manual MP3 drops also work)
+    │   ↳ <hash>.vtt             │   (manual M4A drops also work)
     ╰────────────────────────────╯
 ```
 
@@ -43,7 +43,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 
 - **Python 3.14** (pinned via `.python-version` in each subdir)
 - **uv** for env / deps / lockfile (`uv sync`, `uv run …`)
-- **local/**: Playwright (Chromium), mlx-whisper, Pillow, python-dotenv; the summarisation pass talks to a remote Ollama HTTP API (no Python client dep); M4A conversion shells out to `ffmpeg` (system binary on PATH); cover-art is pure-Python (Pillow + Apple Color Emoji), no AI / no network
+- **local/**: Playwright (Chromium), mlx-whisper, Pillow, python-dotenv; the summarisation pass talks to a remote Ollama HTTP API (no Python client dep); MP3-to-M4A conversion shells out to `ffmpeg` (system binary on PATH); cover-art is pure-Python (Pillow + Apple Color Emoji), no AI / no network
 - **cloud/**: FastAPI, uvicorn[standard], python-dotenv
 - Standard library `xml.etree.ElementTree` for RSS (no extra dep)
 
@@ -52,14 +52,16 @@ and `README.md`. Never merge them — they ship to different hosts.
 | Path | Role |
 |---|---|
 | [local/scraper.py](local/scraper.py) | Playwright scraper. Lists notebooks, picks new ones, downloads audio, writes JSON, runs convert → transcribe → summarise → cover-art passes at end (sequential — order matters for manually-dropped audio). |
-| [local/convert.py](local/convert.py) | ffmpeg M4A → `<md5(m4a-bytes)>.mp3`. Scans for `.m4a` files; idempotent (hash-based output filename, skips if `<hash>.mp3` already exists). Standalone CLI + importable `convert_missing()`. |
-| [local/transcribe.py](local/transcribe.py) | MLX Whisper → WebVTT (on-device). Scans for MP3s missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
-| [local/summarize.py](local/summarize.py) | Ollama text model → `<basename>.json`. Scans for MP3s missing `.json` but having `.vtt`; strips VTT cue headers, asks Ollama (JSON mode) for `{title, description, emoji}`, validates the emoji (rejects shortcodes / words via `_extract_emoji()`), writes a sidecar mirroring scraper.py's shape (`source: "manual"`, `notebook_emoji` populated from the LLM). Also exposes `--backfill-emojis` (cheap emoji-only LLM call for existing manual sidecars). Standalone CLI + importable `summarise_missing()` / `backfill_emojis()`. |
-| [local/coverart.py](local/coverart.py) | Pillow → `<hash>.png` (1400×1400). Reads the `notebook_emoji` field scraper.py captured from NotebookLM's auto-assigned icon and renders it full-bleed on a per-episode gradient circle. No AI, no network. Scans for MP3s missing `.png`. Standalone CLI + importable `cover_missing()`. |
-| [local/chapters.py](local/chapters.py) | Ollama → `<basename>.chaptermarks.txt`. Scans for MP3s missing chapter marks; asks Ollama to group transcript chunks into cohesive chapters, writes FFmpeg metadata, embeds them via FFmpeg, and restores ID3 tags. Standalone CLI + importable `chapters_missing()`. |
+| [local/convert.py](local/convert.py) | ffmpeg MP3 → `<md5(mp3-bytes)>.m4a`. Scans for `.mp3` files; idempotent (hash-based output filename, skips if `<hash>.m4a` already exists). Standalone CLI + importable `convert_missing()`. |
+| [local/transcribe.py](local/transcribe.py) | MLX Whisper → WebVTT (on-device). Scans for M4As missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
+| [local/summarize.py](local/summarize.py) | Ollama text model → `<basename>.json`. Scans for M4As missing `.json` but having `.vtt`; strips VTT cue headers, asks Ollama (JSON mode) for `{title, description, emoji}`, validates the emoji (rejects shortcodes / words via `_extract_emoji()`), writes a sidecar mirroring scraper.py's shape (`source: "manual"`, `notebook_emoji` populated from the LLM). Also exposes `--backfill-emojis` (cheap emoji-only LLM call for existing manual sidecars). Standalone CLI + importable `summarise_missing()` / `backfill_emojis()`. |
+| [local/coverart.py](local/coverart.py) | Pillow → `<hash>.png` (1400×1400). Reads the `notebook_emoji` field scraper.py captured from NotebookLM's auto-assigned icon and renders it full-bleed on a per-episode gradient circle. No AI, no network. Scans for M4As missing `.png`. Standalone CLI + importable `cover_missing()`. |
+| [local/chapters.py](local/chapters.py) | Ollama → `<basename>.chaptermarks.txt`. Scans for M4As missing chapter marks; asks Ollama to group transcript chunks into cohesive chapters, writes FFmpeg metadata, embeds them via FFmpeg with `-f ipod` output format (preserves MP4 atoms). Standalone CLI + importable `chapters_missing()`. |
+| [local/id3tag.py](local/id3tag.py) | mutagen.mp4 → verifies and repairs standard podcast MP4 metadata atoms on every M4A file (using sidecar JSON and cover PNG). Standalone CLI + importable `tag_missing()`. |
+| [local/migrate.py](local/migrate.py) | **New.** One-time bulk migration script to re-encode all existing `.mp3` files in OUTPUT_DIR to `.m4a`, update JSON sidecar references, re-embed chapters, apply MP4 metadata atoms, and delete original MP3s. |
 | [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`, `pillow`, `mutagen`, `google-genai`. |
 | [local/.env.example](local/.env.example) | Local-side config template. |
-| [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware) + `GET /transcripts/{name}` + `GET /images/{name}`. Reads files directly from `OUTPUT_DIR`. |
+| [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware M4A) + `GET /transcripts/{name}` + `GET /images/{name}`. Reads files directly from `OUTPUT_DIR`. |
 | [cloud/pyproject.toml](cloud/pyproject.toml) | Deps: `fastapi`, `uvicorn[standard]`, `python-dotenv`. |
 | [cloud/.env.example](cloud/.env.example) | Cloud-side config template. |
 | [orchestrate.py](orchestrate.py) | Top-level asyncio supervisor. Spawns `cloud/app.py` (long-running, restarted on crash) and `local/scraper.py` (once at startup, then every `SCRAPE_INTERVAL_S`, default 3600s). Stdlib-only, no root pyproject. Both children are launched via `uv run …` in their own subdirs so each picks up its own `.env`. Signal-handled (SIGINT/SIGTERM → SIGTERM children, 10s grace, SIGKILL). |
@@ -76,18 +78,21 @@ uv run scraper.py                      # main entry (cron-driven)
 uv run scraper.py --list               # debug: enumerate notebooks
 uv run scraper.py --url <URL>          # force a specific notebook
 uv run scraper.py --backfill-emojis    # fill notebook_emoji into legacy JSONs, rerender covers
-uv run convert.py                      # transcode any .m4a files to <hash>.mp3
-uv run convert.py --file foo.m4a       # convert one file
-uv run transcribe.py                   # transcribe any MP3 missing a .vtt
-uv run transcribe.py --file foo.mp3    # transcribe one file
-uv run summarize.py                    # generate JSON sidecars for manual MP3s (needs .vtt)
-uv run summarize.py --file foo.mp3     # summarise one file
+uv run migrate.py                      # bulk convert all existing MP3s to M4As, update sidecars
+uv run migrate.py --dry-run            # verify migration plan
+uv run migrate.py --keep-mp3           # convert without deleting original MP3s
+uv run convert.py                      # transcode any manually dropped .mp3 files to <hash>.m4a
+uv run convert.py --file foo.mp3       # convert one file
+uv run transcribe.py                   # transcribe any M4A missing a .vtt
+uv run transcribe.py --file foo.m4a    # transcribe one file
+uv run summarize.py                    # generate JSON sidecars for manual M4As (needs .vtt)
+uv run summarize.py --file foo.m4a     # summarise one file
 uv run summarize.py --backfill-emojis  # ask LLM for an emoji for existing sidecars missing one
-uv run coverart.py                     # generate cover PNGs for any MP3 missing one
-uv run coverart.py --file foo.mp3      # generate one cover
+uv run coverart.py                     # generate cover PNGs for any M4A missing one
+uv run coverart.py --file foo.m4a      # generate one cover
 uv run coverart.py --force             # regenerate everything
-uv run chapters.py                     # generate chapter marks for any MP3 missing one
-uv run chapters.py --file foo.mp3      # generate chapters for one file
+uv run chapters.py                     # generate chapter marks for any M4A missing one
+uv run chapters.py --file foo.m4a      # generate chapters for one file
 uv run chapters.py --force             # regenerate chapters even if they exist
 
 # cloud side
@@ -119,16 +124,20 @@ to the same Google-Drive-synced folder.
   `1400`), `COVER_DEFAULT_EMOJI` (default `🎙️` — used when the sidecar
   JSON has no `notebook_emoji`), `APPLE_EMOJI_FONT` (default
   `/System/Library/Fonts/Apple Color Emoji.ttc`).
-- Summarisation of manual MP3s (Ollama, same host): `OLLAMA_TEXT_MODEL`
+- Summarisation of manual M4As (Ollama, same host): `OLLAMA_TEXT_MODEL`
   (default `charaf/qwen3.6-35b-a3b-coding-nvfp4-mlx:latest`),
   `SUMMARY_TIMEOUT_S` (default `600`). `TITLE_PREFIX` is reused to keep
   manual episode titles in the same `<prefix> - <topic>` shape as scraper
   output.
+- Conversion (FFmpeg, local): `AAC_BITRATE` (default `128k` CBR).
+- MP4 metadata tagging: `PODCAST_AUTHOR` (default `NotebookLM`),
+  `PODCAST_ALBUM` (default to `TITLE_PREFIX`), `PODCAST_GENRE` (default `Podcast`),
+  `PODCAST_FEED_URL` (optional WFED url).
 
 `cloud/.env` knobs:
 - Required: `OUTPUT_DIR`, `FEED_BASE_URL` (the public URL of the FastAPI
   app itself, no trailing slash — enclosure URLs are built as
-  `${FEED_BASE_URL}/audio/<filename>.mp3`)
+  `${FEED_BASE_URL}/audio/<filename>.m4a`)
 - Optional: `FEED_TITLE`, `FEED_DESCRIPTION`, `FEED_AUTHOR`,
   `FEED_OWNER_EMAIL`, `FEED_LANGUAGE`, `FEED_CATEGORY`, `FEED_IMAGE_URL`
   (drop a `cover.png` into `OUTPUT_DIR` and set this to
@@ -147,23 +156,24 @@ OUTPUT_DIR=/Users/.../My\ Drive/Podcasts        # backslash escape
 OUTPUT_DIR="/Users/.../My Drive/Podcasts"       # quoted
 ```
 `python-dotenv` reads values **literally** — it does not unescape `\ ` or
-strip quotes. All six scripts (`local/scraper.py`, `local/convert.py`,
+strip quotes. All scripts (`local/scraper.py`, `local/convert.py`,
 `local/transcribe.py`, `local/summarize.py`, `local/coverart.py`,
-`cloud/app.py`) defensively run path values through `_clean_path_value()`
-to handle both styles. Keep this helper when adding new scripts.
+`local/migrate.py`, `cloud/app.py`) defensively run path values through
+`_clean_path_value()` to handle both styles. Keep this helper when adding
+new scripts.
 
 ## Data model
 
 Each scraped episode produces two sibling files (and later `.vtt` + `.png`):
 
-- **`<hash>.mp3`** — raw audio download from NotebookLM's "Audio Overview" kebab → Download.
+- **`<hash>.m4a`** — raw audio download from NotebookLM's "Audio Overview" kebab → Download (or transcoded from MPEG).
 - **`<hash>.json`** — episode metadata:
   ```json
   {
     "id": "<md5-of-normalized-description>",
     "title": "NotebookLM Overview - <notebook title>",
     "description": "<cleaned chat-panel summary>",
-    "audio_file": "<hash>.mp3",
+    "audio_file": "<hash>.m4a",
     "pub_date": "<ISO-8601 UTC>",
     "notebook_id": "<UUID from URL>",
     "notebook_url": "https://notebooklm.google.com/notebook/<UUID>",
@@ -181,7 +191,7 @@ Each scraped episode produces two sibling files (and later `.vtt` + `.png`):
   read from leave it null; coverart.py falls back to
   `COVER_DEFAULT_EMOJI` for those. Use
   `uv run scraper.py --backfill-emojis` to run the backfill + cover
-  rerender + id3 retag without scraping any new episodes.
+  rerender + metadata retag without scraping any new episodes.
 - **`<hash>.vtt`** — WebVTT transcript (added by `transcribe.py`).
 - **`<hash>.png`** — cover art (added by `coverart.py`).
 
@@ -267,40 +277,43 @@ summary, the Studio panel label set.
   MLX deps are installed (Mac-only). On non-Mac hosts the import will fail
   per-file and be logged.
 
-## M4A → MP3 conversion specifics (manual audio ingest)
+## MP3 → M4A conversion specifics (manual audio ingest)
 
-- Lets the user drop arbitrary `.m4a` files (e.g. from Voice Memos) into
-  `OUTPUT_DIR` and have them join the pipeline. Runs as the first
+- Lets the user drop arbitrary `.mp3` files (e.g. from Voice Memos or other sources)
+  into `OUTPUT_DIR` and have them join the pipeline. Runs as the first
   post-scrape pass in `scraper.py`; also standalone via `uv run convert.py`.
 - **Idempotency hinges on the output filename being a hash of the input
-  bytes** (`md5(m4a-bytes).mp3`, streamed read in 1 MiB chunks). On every
-  run we re-hash each `.m4a`, check for an existing `<hash>.mp3`, and skip
-  if it's already there. This means the source `.m4a` can stay in the
-  folder indefinitely without ever re-encoding, and renaming the m4a
+  bytes** (`md5(mp3-bytes).m4a`, streamed read in 1 MiB chunks). On every
+  run we re-hash each `.mp3`, check for an existing `<hash>.m4a`, and skip
+  if it's already there. This means the source `.mp3` can stay in the
+  folder indefinitely without ever re-encoding, and renaming the mp3
   doesn't trigger a re-encode either (same bytes → same hash → skip). To
   force a fresh encode, use `--force`.
-- The original `.m4a` is **never deleted or renamed**. The user can clean
-  up by hand once they're satisfied with the MP3.
-- Encoder: `ffmpeg -vn -c:a libmp3lame -q:a $MP3_QUALITY` (VBR, default
-  q=2 ≈ 190 kbps). `-vn` drops any embedded artwork/video stream that
+- The original `.mp3` is **never deleted or renamed** by `convert.py` (the migration
+  script deletes them, but the ingestion pipeline leaves them for manual cleanup).
+  The user can clean up by hand once they're satisfied with the M4A.
+- Encoder: `ffmpeg -vn -c:a aac -b:a $AAC_BITRATE -f ipod` (CBR, default
+  bitrate is 128k). `-vn` drops any embedded artwork/video stream that
   Voice Memos and the like sometimes carry.
-- We write to `.<hash>.mp3.partial` first, then `Path.replace()` (atomic
+- We write to `.<hash>.m4a.partial` first, then `Path.replace()` (atomic
   rename) to the final name — a crash mid-encode cannot leave a corrupt
-  `<hash>.mp3` that the idempotency check would later treat as finished.
+  `<hash>.m4a` that the idempotency check would later treat as finished.
 - Fails loudly if `ffmpeg` isn't on PATH (`shutil.which("ffmpeg")`); does
   not silently fall back to anything. macOS install: `brew install ffmpeg`.
-- Once the `.mp3` lands, the downstream passes pick it up by their normal
-  scan rules — no special-casing needed for "this MP3 came from an M4A".
+- Once the `.m4a` lands, the downstream passes pick it up by their normal
+  scan rules — no special-casing needed for "this M4A came from an MP3".
+- Manually dropped `.m4a` files are already in the target format and are ignored
+  by `convert.py`, but are processed normally by the downstream passes.
 
-## Summarisation specifics (manual MP3 ingest)
+## Summarisation specifics (manual M4A ingest)
 
-- Lets the user drop an arbitrary `<basename>.mp3` into `OUTPUT_DIR` and
+- Lets the user drop an arbitrary `<basename>.m4a` into `OUTPUT_DIR` and
   still get a proper feed entry. Triggered automatically by `scraper.py`
   between the transcribe and cover-art passes; also runnable standalone
   via `uv run summarize.py`.
-- Acts only on MP3s that **lack** a `<basename>.json`. Scraper-downloaded
+- Acts only on M4As that **lack** a `<basename>.json`. Scraper-downloaded
   episodes already have one, so the pass is a no-op for them.
-- Needs a matching `<basename>.vtt` next to the MP3 — if it's missing
+- Needs a matching `<basename>.vtt` next to the M4A — if it's missing
   (transcription hasn't run yet or failed), the file is skipped with a
   warning. Run transcribe.py first.
 - VTT → plain text via `_vtt_to_text()`: drops the `WEBVTT` header,
@@ -322,8 +335,8 @@ summary, the Studio panel label set.
   `description`, `audio_file`, `pub_date`, plus null `notebook_*` fields
   and `"source": "manual"` so it's easy to spot manual entries. `id` is
   `md5(filename)` (same scheme the cloud app uses for synthesised GUIDs
-  on bare MP3s — keeps the feed GUID stable when the sidecar is added).
-- `pub_date` comes from the MP3's mtime, so dropping an old file in won't
+  on bare M4As — keeps the feed GUID stable when the sidecar is added).
+- `pub_date` comes from the M4A's mtime, so dropping an old file in won't
   pretend it's brand new.
 - Title is formatted as `"<TITLE_PREFIX> - <topic>"` to match the rest of
   the feed; if the model already prepended the prefix we strip it before
@@ -331,14 +344,13 @@ summary, the Studio panel label set.
 - `summarize.py --backfill-emojis` walks any existing sidecar whose
   `notebook_emoji` is missing/empty and asks the LLM for *only* an
   emoji (using a tiny prompt, leaving title/description untouched),
-  then triggers cover rerender + ID3 retag — symmetric with
-  `scraper.py --backfill-emojis`. Use this after upgrading from a
-  summarize.py that pre-dates the LLM emoji field.
+  then triggers cover rerender + MP4 atom retag — symmetric with
+  `scraper.py --backfill-emojis`.
 
 ## Cover-art specifics
 
 - Runs after the summary pass in `scraper.py` (and on demand via
-  `coverart.py`). For every `<hash>.mp3` lacking a sibling `<hash>.png`,
+  `coverart.py`). For every `<hash>.m4a` lacking a sibling `<hash>.png`,
   read `notebook_emoji` + `title` from `<hash>.json` and render a
   `COVER_SIZE`×`COVER_SIZE` PNG (default 1400²) showing that emoji
   full-bleed on a per-episode gradient circle. Everything happens in
@@ -365,7 +377,7 @@ summary, the Studio panel label set.
   half-flushed `<hash>.png` that the idempotency check would later
   treat as finished.
 - Falls back to `COVER_DEFAULT_EMOJI` (🎙️ by default) whenever the
-  sidecar JSON has no `notebook_emoji` — manually-dropped MP3s,
+  sidecar JSON has no `notebook_emoji` — manually-dropped M4As,
   `--url`-forced scraper runs, and legacy episodes scraped before
   emoji capture was added. `notebook_emoji` itself is captured by
   `scraper.py`'s `parse_card_emoji()` from the first line of each
@@ -378,9 +390,10 @@ summary, the Studio panel label set.
 
 - **No disk writes.** The feed is built per request — there is no `feed.xml`
   stored in `OUTPUT_DIR` anymore.
-- **`/audio/{filename}`** streams MP3s with HTTP Range support (single
-  range only). Apple Podcasts and Overcast require Range to seek. Multi-
-  range and zero-length suffix ranges return 416.
+- **`/audio/{filename}`** streams M4As with HTTP Range support (single
+  range only) and serves them with `Content-Type: audio/x-m4a`. Apple
+  Podcasts and Overcast require Range to seek. Multi-range and
+  zero-length suffix ranges return 416.
 - **`/transcripts/{filename}`** serves WebVTT (`.vtt`) files whole (they're
   tens-to-hundreds of KB; no Range support). Content-Type is
   `text/vtt; charset=utf-8`.
@@ -390,27 +403,23 @@ summary, the Studio panel label set.
   show-level cover referenced by `FEED_IMAGE_URL` (drop a `cover.png` into
   `OUTPUT_DIR` and point `FEED_IMAGE_URL` at
   `${FEED_BASE_URL}/images/cover.png`).
-- Each `/feed.xml` item with a sibling `.vtt` next to its `.mp3` gets a
+- Each `/feed.xml` item with a sibling `.vtt` next to its `.m4a` gets a
   Podcasting 2.0 `<podcast:transcript url=… type="text/vtt" lang=…>` tag.
   Language is `FEED_LANGUAGE.split("-")[0]` (so `en-us` → `en`).
-- Each item with a sibling `.png` next to its `.mp3` gets an
-  `<itunes:image href=…>` tag. Apple Podcasts prefers ≥1400×1400 — the
-  512×512 default of [local/coverart.py](local/coverart.py) may be
-  silently rejected there even if Overcast/Pocket Casts show it fine.
+- Each item with a sibling `.png` next to its `.m4a` gets an
+  `<itunes:image href=…>` tag. Apple Podcasts prefers ≥1400×1400.
 - **Path safety**: `_safe_resolve()` rejects names containing `/`, `\`,
   leading `.`, wrong suffix, or that fall outside `OUTPUT_DIR` after
   `.resolve()`. All three of `/audio`, `/transcripts`, `/images` share it
   (different `suffix` arg per call).
-- Iterates `*.mp3` (NOT `*.json`) — bare MP3s dropped into the folder are
+- Iterates `*.m4a` (NOT `*.json`) — bare M4As dropped into the folder are
   picked up too. Synthesised metadata uses filename + mtime; GUID is
   `md5(filename)` so reruns stay stable.
-- Enclosure URLs: `f"{FEED_BASE_URL}/audio/{audio_file}"`. Transcript URLs:
-  `f"{FEED_BASE_URL}/transcripts/{vtt_file}"`. Image URLs:
-  `f"{FEED_BASE_URL}/images/{png_file}"`. `FEED_BASE_URL` is the public
-  URL of the FastAPI app itself.
+- Enclosure URLs: `f"{FEED_BASE_URL}/audio/{audio_file}"` (referencing `.m4a`).
+  Transcript URLs: `f"{FEED_BASE_URL}/transcripts/{vtt_file}"`. Image URLs:
+  `f"{FEED_BASE_URL}/images/{png_file}"`.
 - All three namespaces (`itunes`, `atom`, `podcast`) are registered via
-  `ET.register_namespace()` (do NOT pass `xmlns:*` manually as an
-  attribute — ElementTree will emit `ns0:`/`ns1:` prefixes).
+  `ET.register_namespace()`.
 - All endpoints support both `GET` and `HEAD` (via `@app.api_route`); HEAD
   short-circuits to a body-less `Response` with full headers. Apple
   Podcasts probes enclosures with HEAD.
@@ -464,7 +473,7 @@ summary, the Studio panel label set.
 
 ```bash
 # Sanity-check Python compiles after edits
-uv --project local run python -m py_compile local/scraper.py local/convert.py local/transcribe.py local/summarize.py local/chapters.py local/coverart.py local/id3tag.py
+uv --project local run python -m py_compile local/scraper.py local/convert.py local/transcribe.py local/summarize.py local/chapters.py local/coverart.py local/id3tag.py local/migrate.py
 uv --project cloud run python -m py_compile cloud/app.py
 
 # Confirm the Ollama host is reachable and the image model is installed
@@ -476,7 +485,7 @@ curl -fsS "$OLLAMA_BASE_URL/api/tags" | python3 -c "import sys,json; print([m['n
 # Smoke-test the cloud app
 ( cd cloud && uv run uvicorn app:app --port 8000 ) &
 curl -fsS http://127.0.0.1:8000/feed.xml | xmllint --noout - && echo VALID
-curl -sI -H 'Range: bytes=0-1023' http://127.0.0.1:8000/audio/<hash>.mp3
+curl -sI -H 'Range: bytes=0-1023' http://127.0.0.1:8000/audio/<hash>.m4a
 # Expect: 206 Partial Content + Content-Range: bytes 0-1023/<size>
 
 # Inspect cleaned descriptions for existing episodes
@@ -547,16 +556,16 @@ mkdir -p ~/chrome-debug-profile
 
 # every session: fully quit Chrome first, then:
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/chrome-debug-profile"
+   --remote-debugging-port=9222 \
+   --user-data-dir="$HOME/chrome-debug-profile"
 ```
 
 The user signs into Google once in that window; the profile persists across
 sessions. To verify the port is live before involving the MCP server:
 
 ```bash
-curl -s http://127.0.0.1:9222/json/version | head -3
 # should print {"Browser": "Chrome/...", "Protocol-Version": "1.3", ...
+curl -s http://127.0.0.1:9222/json/version | head -3
 ```
 
 If `curl` returns nothing, Chrome silently refused to enable the port —

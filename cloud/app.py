@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-FastAPI cloud app: serves a podcast RSS feed and streams MP3s from OUTPUT_DIR.
+FastAPI cloud app: serves a podcast RSS feed and streams M4As from OUTPUT_DIR.
 
 The same OUTPUT_DIR the local scraper writes into (typically a Google Drive
 folder synced down to this machine) is read here. Episodes are discovered by
-scanning *.mp3 files; if a sibling <basename>.json exists (written by the
+scanning *.m4a files; if a sibling <basename>.json exists (written by the
 scraper) its metadata is used, otherwise a minimal record is synthesised from
-the filename and mtime — so dropping a bare audio.mp3 into the folder still
+the filename and mtime — so dropping a bare audio.m4a into the folder still
 gets picked up.
 
 Endpoints:
   GET /                    → tiny human-readable index
   GET /feed.xml            → RSS 2.0 + iTunes + Podcasting 2.0 feed (per request)
-  GET /audio/{name}        → streams an MP3 from OUTPUT_DIR, with HTTP Range
+  GET /audio/{name}        → streams an M4A from OUTPUT_DIR, with HTTP Range
                              support (required by Apple Podcasts for seeking)
   GET /transcripts/{name}  → serves a WebVTT transcript from OUTPUT_DIR.
                              Referenced from each item via <podcast:transcript>.
@@ -102,26 +102,26 @@ log = logging.getLogger("cloud")
 # Episode discovery (same shape as the old feed.py)
 # ---------------------------------------------------------------------------
 
-def _synthesize_metadata(mp3: Path) -> dict:
-    """Build a minimal episode record from a bare MP3 file (no JSON sidecar)."""
-    stat = mp3.stat()
+def _synthesize_metadata(m4a: Path) -> dict:
+    """Build a minimal episode record from a bare M4A file (no JSON sidecar)."""
+    stat = m4a.stat()
     mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-    guid = hashlib.md5(mp3.name.encode("utf-8")).hexdigest()
-    title = re.sub(r"[\-_]+", " ", mp3.stem).strip() or mp3.stem
+    guid = hashlib.md5(m4a.name.encode("utf-8")).hexdigest()
+    title = re.sub(r"[\-_]+", " ", m4a.stem).strip() or m4a.stem
     return {
         "id": guid,
         "title": title,
-        "description": f"Audio file: {mp3.name}",
-        "audio_file": mp3.name,
+        "description": f"Audio file: {m4a.name}",
+        "audio_file": m4a.name,
         "pub_date": mtime.isoformat(),
     }
 
 
 def load_episodes(output_dir: Path) -> list[dict]:
-    """Return episode dicts (newest first), one per *.mp3 in output_dir."""
+    """Return episode dicts (newest first), one per *.m4a in output_dir."""
     out: list[dict] = []
-    for mp3 in output_dir.glob("*.mp3"):
-        sidecar = mp3.with_suffix(".json")
+    for m4a in output_dir.glob("*.m4a"):
+        sidecar = m4a.with_suffix(".json")
         meta: Optional[dict] = None
         if sidecar.exists():
             try:
@@ -130,14 +130,14 @@ def load_episodes(output_dir: Path) -> list[dict]:
                 log.warning("Sidecar %s unreadable (%s); synthesising.", sidecar.name, e)
                 meta = None
         if meta is None:
-            meta = _synthesize_metadata(mp3)
-        meta["audio_file"] = mp3.name
-        st = mp3.stat()
+            meta = _synthesize_metadata(m4a)
+        meta["audio_file"] = m4a.name
+        st = m4a.stat()
         meta["_size"] = st.st_size
         meta["_mtime"] = st.st_mtime
-        vtt = mp3.with_suffix(".vtt")
+        vtt = m4a.with_suffix(".vtt")
         meta["_transcript_file"] = vtt.name if vtt.exists() else None
-        png = mp3.with_suffix(".png")
+        png = m4a.with_suffix(".png")
         meta["_image_file"] = png.name if png.exists() else None
         out.append(meta)
     out.sort(key=lambda m: m.get("pub_date") or "", reverse=True)
@@ -206,7 +206,7 @@ def build_feed(episodes: list[dict], base_url: str) -> str:
         enclosure = ET.SubElement(item, "enclosure")
         enclosure.set("url", f"{base_url}/audio/{ep['audio_file']}")
         enclosure.set("length", str(ep["_size"]))
-        enclosure.set("type", "audio/mpeg")
+        enclosure.set("type", "audio/x-m4a")
 
         # Podcasting 2.0 transcript tag — points clients at the WebVTT file
         # alongside the MP3 (written by local/transcribe.py).
@@ -402,13 +402,13 @@ def serve_feed(request: Request) -> Response:
 
 @app.api_route("/audio/{filename}", methods=["GET", "HEAD"])
 def serve_audio(filename: str, request: Request) -> Response:
-    """Stream an MP3 from OUTPUT_DIR with HTTP Range support.
+    """Stream an M4A from OUTPUT_DIR with HTTP Range support.
 
     Range support is required by Apple Podcasts and most podcast clients to
     seek inside an episode. We honour single-range requests; multi-range is
     rare in podcast clients and rejected with 416.
     """
-    path = _safe_resolve(filename, ".mp3")
+    path = _safe_resolve(filename, ".m4a")
     file_size = path.stat().st_size
     last_modified = format_datetime(
         datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
@@ -451,12 +451,12 @@ def serve_audio(filename: str, request: Request) -> Response:
             "Cache-Control": "public, max-age=3600",
         }
         if is_head:
-            return Response(status_code=206, headers=headers, media_type="audio/mpeg")
+            return Response(status_code=206, headers=headers, media_type="audio/x-m4a")
         return StreamingResponse(
             _iter_file(path, start, end),
             status_code=206,
             headers=headers,
-            media_type="audio/mpeg",
+            media_type="audio/x-m4a",
         )
 
     headers = {
@@ -467,11 +467,11 @@ def serve_audio(filename: str, request: Request) -> Response:
         "Cache-Control": "public, max-age=3600",
     }
     if is_head:
-        return Response(headers=headers, media_type="audio/mpeg")
+        return Response(headers=headers, media_type="audio/x-m4a")
     return StreamingResponse(
         _iter_file(path, 0, file_size - 1),
         headers=headers,
-        media_type="audio/mpeg",
+        media_type="audio/x-m4a",
     )
 
 

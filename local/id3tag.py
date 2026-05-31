@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Verify and (re)write the standard podcast ID3v2 tag set on every <hash>.mp3
-in OUTPUT_DIR, using each MP3's sibling <hash>.json for metadata and the
+Verify and (re)write the standard podcast MP4 atoms on every <hash>.m4a
+in OUTPUT_DIR, using each M4A's sibling <hash>.json for metadata and the
 sibling <hash>.png as cover art (when present).
 
-For every *.mp3 in OUTPUT_DIR we build the canonical tag set from the JSON
+For every *.m4a in OUTPUT_DIR we build the canonical tag set from the JSON
 sidecar and compare it to what's currently on the file. If anything is
-missing or differs, we rewrite the affected frames. Files that already
+missing or differs, we rewrite the affected atoms. Files that already
 carry the full expected tag set are skipped — the pass is fully idempotent.
 
-  uv run id3tag.py                 # verify/repair tags on all MP3s
-  uv run id3tag.py --file foo.mp3  # tag one specific file
+  uv run id3tag.py                 # verify/repair tags on all M4As
+  uv run id3tag.py --file foo.m4a  # tag one specific file
   uv run id3tag.py --check         # report mismatches without writing
   uv run id3tag.py --force         # rewrite tags even when they already match
 
@@ -18,18 +18,18 @@ Configured via PODCAST_AUTHOR / PODCAST_ALBUM / PODCAST_GENRE / PODCAST_FEED_URL
 in .env. The album defaults to TITLE_PREFIX (shared with scraper.py and
 summarize.py) so manual + scraped episodes appear under the same show.
 
-Standard frames we maintain (ID3v2.4):
-  TIT2  episode title       (from JSON.title)
-  TPE1  artist / host       (PODCAST_AUTHOR)
-  TALB  album / show name   (PODCAST_ALBUM, defaults to TITLE_PREFIX)
-  TCON  genre               (PODCAST_GENRE, defaults to "Podcast")
-  TDRC  recording date      (JSON.pub_date)
-  COMM  comment             (JSON.description, plain-text)
-  TDES  iTunes long desc.   (JSON.description)
-  TGID  episode GUID        (JSON.id)
-  WFED  feed URL            (PODCAST_FEED_URL, optional)
-  APIC  cover image         (<hash>.png, if present — PNG, "Cover (front)")
-  PCST  podcast flag        (constant 0x00000000)
+Standard atoms we maintain:
+  ©nam  episode title       (from JSON.title)
+  ©ART  artist / host       (PODCAST_AUTHOR)
+  ©alb  album / show name   (PODCAST_ALBUM, defaults to TITLE_PREFIX)
+  ©gen  genre               (PODCAST_GENRE, defaults to "Podcast")
+  ©day  recording date      (JSON.pub_date)
+  ©cmt  comment             (JSON.description, plain-text)
+  desc  iTunes long desc.   (JSON.description)
+  ----:com.apple.iTunes:PODCAST-GUID  episode GUID (JSON.id)
+  purl  feed URL            (PODCAST_FEED_URL, optional)
+  covr  cover image         (<hash>.png, if present — PNG format)
+  pcst  podcast flag        (constant boolean True)
 """
 
 from __future__ import annotations
@@ -43,22 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from mutagen.id3 import (
-    APIC,
-    COMM,
-    ID3,
-    ID3NoHeaderError,
-    PCST,
-    TALB,
-    TCON,
-    TDES,
-    TDRC,
-    TGID,
-    TIT2,
-    TPE1,
-    WFED,
-)
-from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
@@ -91,11 +76,11 @@ log = logging.getLogger("id3tag")
 
 
 # ---------------------------------------------------------------------------
-# Frame construction
+# Atom construction
 # ---------------------------------------------------------------------------
 
-def _load_sidecar(mp3: Path) -> Optional[dict]:
-    json_path = mp3.with_suffix(".json")
+def _load_sidecar(m4a: Path) -> Optional[dict]:
+    json_path = m4a.with_suffix(".json")
     if not json_path.exists():
         return None
     try:
@@ -105,208 +90,158 @@ def _load_sidecar(mp3: Path) -> Optional[dict]:
         return None
 
 
-def _pub_date_for_id3(meta: dict, mp3: Path) -> str:
-    """Return the date string for TDRC. Accepts an ISO-8601 timestamp from the
-    sidecar, falls back to the MP3's mtime in YYYY-MM-DD form.
-
-    TDRC takes an ID3v2.4 timestamp; mutagen happily accepts ISO-ish strings
-    (YYYY, YYYY-MM-DD, full ISO) and stores them verbatim."""
+def _pub_date_for_m4a(meta: dict, m4a: Path) -> str:
+    """Return the date string for ©day. Accepts an ISO-8601 timestamp from the
+    sidecar, falls back to the M4A's mtime in ISO-8601 form."""
     raw = (meta.get("pub_date") or "").strip()
     if raw:
-        # Drop any trailing timezone offset that mutagen's TDRC parser
-        # doesn't strip (it stores "2026-05-30T12:34:56+00:00" verbatim
-        # which is fine for podcatchers but noisy on display). Keep
-        # whatever the sidecar wrote — we just want a stable, comparable
-        # representation.
         return raw
     from datetime import datetime, timezone
 
-    return datetime.fromtimestamp(mp3.stat().st_mtime, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(m4a.stat().st_mtime, tz=timezone.utc).isoformat()
 
 
-def _expected_frames(meta: dict, mp3: Path, png_bytes: Optional[bytes]) -> dict:
-    """Build a dict of frame_id → mutagen frame instance representing the
-    canonical tag set for this episode. Used both to write tags and to
+def _expected_atoms(meta: dict, m4a: Path, png_bytes: Optional[bytes]) -> dict:
+    """Build a dict of atom_key → mutagen atom representation representing the
+    canonical atom set for this episode. Used both to write tags and to
     compare against what's already on disk."""
-    title = (meta.get("title") or mp3.stem).strip()
+    title = (meta.get("title") or m4a.stem).strip()
     description = (meta.get("description") or "").strip()
-    episode_id = (meta.get("id") or mp3.stem).strip()
-    date_str = _pub_date_for_id3(meta, mp3)
+    episode_id = (meta.get("id") or m4a.stem).strip()
+    date_str = _pub_date_for_m4a(meta, m4a)
 
-    frames: dict = {
-        "TIT2": TIT2(encoding=3, text=title),
-        "TPE1": TPE1(encoding=3, text=PODCAST_AUTHOR),
-        "TALB": TALB(encoding=3, text=PODCAST_ALBUM),
-        "TCON": TCON(encoding=3, text=PODCAST_GENRE),
-        "TDRC": TDRC(encoding=3, text=date_str),
-        # COMM is keyed by (lang, desc); use 'eng' + empty desc which is what
-        # most players display as the file-level comment.
-        "COMM::eng": COMM(encoding=3, lang="eng", desc="", text=description),
-        "TDES": TDES(encoding=3, text=description),
-        "TGID": TGID(encoding=3, text=episode_id),
-        # PCST's payload is a 4-byte big-endian integer; iTunes only checks
-        # that the frame exists. mutagen stores it as `value = 0`.
-        "PCST": PCST(value=0),
+    atoms = {
+        "©nam": [title],
+        "©ART": [PODCAST_AUTHOR],
+        "©alb": [PODCAST_ALBUM],
+        "©gen": [PODCAST_GENRE],
+        "©day": [date_str],
+        "©cmt": [description],
+        "desc": [description],
+        "pcst": True,
+        "----:com.apple.iTunes:PODCAST-GUID": [MP4FreeForm(episode_id.encode("utf-8"))],
     }
     if PODCAST_FEED_URL:
-        frames["WFED"] = WFED(url=PODCAST_FEED_URL)
+        atoms["purl"] = [PODCAST_FEED_URL]
     if png_bytes:
-        frames["APIC:"] = APIC(
-            encoding=3,
-            mime="image/png",
-            type=3,           # 3 = Cover (front)
-            desc="",
-            data=png_bytes,
-        )
-    return frames
+        atoms["covr"] = [MP4Cover(png_bytes, imageformat=MP4Cover.FORMAT_PNG)]
+    return atoms
 
 
-def _frame_text(frame) -> str:
-    """Normalize a text/URL frame to a comparable plain string."""
-    if frame is None:
-        return ""
-    if hasattr(frame, "text"):
-        # Text frames hold a list of strings (or ID3TimeStamps for TDRC).
-        return " ".join(str(t) for t in frame.text)
-    if hasattr(frame, "url"):
-        return str(frame.url)
-    return str(frame)
-
-
-def _frames_equal(existing, expected) -> bool:
-    """Compare just enough of two frames to decide whether a rewrite is
-    needed. We compare textual content and (for APIC) the image bytes —
-    not low-level encoding flags, which differ harmlessly across writers."""
+def _atoms_equal(existing, expected) -> bool:
+    """Compare just enough of two atoms/structures to decide whether a rewrite is
+    needed."""
     if existing is None or expected is None:
         return existing is None and expected is None
-    if isinstance(expected, APIC):
+    if isinstance(expected, list):
+        if not isinstance(existing, list) or len(existing) != len(expected):
+            return False
+        return all(_atoms_equal(ex, eq) for ex, eq in zip(existing, expected))
+    if isinstance(expected, MP4Cover):
         return (
-            isinstance(existing, APIC)
-            and existing.mime == expected.mime
-            and existing.type == expected.type
-            and existing.data == expected.data
+            isinstance(existing, MP4Cover)
+            and existing.imageformat == expected.imageformat
+            and bytes(existing) == bytes(expected)
         )
-    if isinstance(expected, PCST):
-        return isinstance(existing, PCST)
-    if isinstance(expected, COMM):
+    if isinstance(expected, MP4FreeForm):
         return (
-            isinstance(existing, COMM)
-            and existing.lang == expected.lang
-            and _frame_text(existing) == _frame_text(expected)
+            isinstance(existing, MP4FreeForm)
+            and bytes(existing) == bytes(expected)
         )
-    return _frame_text(existing) == _frame_text(expected)
+    return existing == expected
 
 
 # ---------------------------------------------------------------------------
 # Per-file driver
 # ---------------------------------------------------------------------------
 
-def _open_mp3(mp3: Path) -> MP3:
-    """Open an MP3 with mutagen, raising a clear RuntimeError if the file
-    isn't actually MPEG audio (NotebookLM has been known to deliver
-    DASH/MP4 chunks with an .mp3 extension — those need different tag
-    frames and should be flagged, not silently re-tagged)."""
+def _open_m4a(m4a: Path) -> MP4:
+    """Open an M4A with mutagen, raising a clear RuntimeError if the file
+    isn't a valid MP4 container."""
     try:
-        return MP3(str(mp3), ID3=ID3)
+        return MP4(str(m4a))
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
-            f"{mp3.name} is not a valid MPEG audio file ({e}); "
-            "ID3 frames cannot be applied. If this came from the scraper, "
-            "the upstream download is probably an MP4/M4A container — "
-            "re-encode via `uv run convert.py` (rename to .m4a first) "
-            "or delete the file."
+            f"{m4a.name} is not a valid MP4 audio file ({e}); "
+            "MP4 atoms cannot be applied."
         ) from e
 
 
-def _diff_tags(mp3: Path, expected: dict) -> list[str]:
-    """Return a list of frame keys that are missing or stale on disk.
-    Raises if the file isn't valid MPEG audio."""
-    audio = _open_mp3(mp3)
+def _diff_tags(m4a: Path, expected: dict) -> list[str]:
+    """Return a list of atom keys that are missing or stale on disk.
+    Raises if the file isn't valid MP4 audio."""
+    audio = _open_m4a(m4a)
     tags = audio.tags
     diffs: list[str] = []
     for key, want in expected.items():
         have = tags.get(key) if tags is not None else None
-        if not _frames_equal(have, want):
+        if not _atoms_equal(have, want):
             diffs.append(key)
     return diffs
 
 
-def tag_one(mp3: Path, *, force: bool = False, check_only: bool = False) -> Optional[list[str]]:
-    """Verify (and, unless check_only, repair) ID3 tags on a single MP3.
+def tag_one(m4a: Path, *, force: bool = False, check_only: bool = False) -> Optional[list[str]]:
+    """Verify (and, unless check_only, repair) MP4 atoms on a single M4A.
 
-    Returns the list of frame keys that needed updating (empty if the file
+    Returns the list of atom keys that needed updating (empty if the file
     was already complete). Returns None if metadata is missing and we
     can't even build the expected tag set."""
-    meta = _load_sidecar(mp3)
+    meta = _load_sidecar(m4a)
     if meta is None:
         log.warning(
-            "No JSON sidecar for %s — run summarize.py first; skipping ID3 verification.",
-            mp3.name,
+            "No JSON sidecar for %s — run summarize.py first; skipping tag verification.",
+            m4a.name,
         )
         return None
 
-    png_path = mp3.with_suffix(".png")
+    png_path = m4a.with_suffix(".png")
     png_bytes = png_path.read_bytes() if png_path.exists() else None
     if png_bytes is None:
-        log.info("No cover PNG for %s; APIC frame will not be embedded.", mp3.name)
+        log.info("No cover PNG for %s; covr atom will not be embedded.", m4a.name)
 
-    expected = _expected_frames(meta, mp3, png_bytes)
-    diffs = list(expected.keys()) if force else _diff_tags(mp3, expected)
+    expected = _expected_atoms(meta, m4a, png_bytes)
+    diffs = list(expected.keys()) if force else _diff_tags(m4a, expected)
 
     if not diffs:
-        log.info("%s already has the full standard tag set.", mp3.name)
+        log.info("%s already has the full standard tag set.", m4a.name)
         return []
 
     if check_only:
         log.warning(
-            "%s missing/stale frames: %s",
-            mp3.name, ", ".join(sorted(diffs)),
+            "%s missing/stale atoms: %s",
+            m4a.name, ", ".join(sorted(diffs)),
         )
         return diffs
 
-    # Load (or create) the ID3 container, replace the affected frames,
-    # and save back as ID3v2.4. We DELETE existing variants of each
-    # frame before re-adding so duplicates can't accumulate.
-    audio = _open_mp3(mp3)
-
+    audio = _open_m4a(m4a)
     if audio.tags is None:
-        try:
-            audio.add_tags()
-        except ID3NoHeaderError:
-            audio.tags = ID3()
+        audio.add_tags()
 
     for key in diffs:
-        # `delall` accepts the frame id without the ":desc" suffix and
-        # removes every instance — so "COMM" wipes COMM::eng, COMM::deu,
-        # etc. That's what we want: one canonical tag per file.
-        base = key.split(":", 1)[0]
-        audio.tags.delall(base)
+        audio.tags[key] = expected[key]
 
-    for key in diffs:
-        audio.tags.add(expected[key])
-
-    audio.save(v2_version=4)
+    audio.save()
     log.info(
-        "Updated %d frame(s) on %s: %s",
-        len(diffs), mp3.name, ", ".join(sorted(diffs)),
+        "Updated %d atom(s) on %s: %s",
+        len(diffs), m4a.name, ", ".join(sorted(diffs)),
     )
     return diffs
 
 
 def tag_missing(output_dir: Path, *, check_only: bool = False) -> tuple[int, int, int]:
-    """Verify ID3 tags on every MP3 in output_dir. Returns
+    """Verify MP4 atoms on every M4A in output_dir. Returns
     (already_ok, updated, failures). When check_only=True, `updated`
     counts files that *would* be updated."""
-    mp3s = sorted(output_dir.glob("*.mp3"))
-    if not mp3s:
-        log.info("ID3 pass: no .mp3 files in %s — nothing to do.", output_dir)
+    m4as = sorted(output_dir.glob("*.m4a"))
+    if not m4as:
+        log.info("M4A tag pass: no .m4a files in %s — nothing to do.", output_dir)
         return 0, 0, 0
 
-    log.info("ID3 pass: verifying %d MP3 file(s).", len(mp3s))
+    log.info("M4A tag pass: verifying %d M4A file(s).", len(m4as))
     ok = updated = failures = 0
-    for mp3 in mp3s:
+    for m4a in m4as:
         try:
-            result = tag_one(mp3, check_only=check_only)
+            result = tag_one(m4a, check_only=check_only)
             if result is None:
                 # No sidecar; counts as neither — already logged.
                 continue
@@ -316,11 +251,11 @@ def tag_missing(output_dir: Path, *, check_only: bool = False) -> tuple[int, int
                 ok += 1
         except Exception as e:  # noqa: BLE001
             failures += 1
-            log.error("Failed to verify/tag %s: %s", mp3.name, e)
+            log.error("Failed to verify/tag %s: %s", m4a.name, e)
 
     verb = "would update" if check_only else "updated"
     log.info(
-        "ID3 pass done. %d already complete, %d %s, %d failed.",
+        "M4A tag pass done. %d already complete, %d %s, %d failed.",
         ok, updated, verb, failures,
     )
     return ok, updated, failures
@@ -342,7 +277,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--file", type=str, default=None,
-        help="Verify/tag one specific MP3 file (path) instead of scanning OUTPUT_DIR.",
+        help="Verify/tag one specific M4A file (path) instead of scanning OUTPUT_DIR.",
     )
     parser.add_argument(
         "--check", action="store_true",
@@ -350,7 +285,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Rewrite all standard frames even if they already match.",
+        help="Rewrite all standard atoms even if they already match.",
     )
     args = parser.parse_args()
 
@@ -358,11 +293,11 @@ def main() -> int:
     assert OUTPUT_DIR is not None
 
     if args.file:
-        mp3 = Path(args.file).expanduser().resolve()
-        if not mp3.exists() or mp3.suffix.lower() != ".mp3":
-            log.error("Not an existing .mp3 file: %s", mp3)
+        m4a = Path(args.file).expanduser().resolve()
+        if not m4a.exists() or m4a.suffix.lower() != ".m4a":
+            log.error("Not an existing .m4a file: %s", m4a)
             return 2
-        result = tag_one(mp3, force=args.force, check_only=args.check)
+        result = tag_one(m4a, force=args.force, check_only=args.check)
         if args.check and result:
             return 1
         return 0

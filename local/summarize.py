@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Generate sidecar JSON metadata for MP3 files in OUTPUT_DIR that lack one,
+Generate sidecar JSON metadata for M4A files in OUTPUT_DIR that lack one,
 by summarizing the matching WebVTT transcript via an Ollama text model.
 
-For every <basename>.mp3 with a matching <basename>.vtt but no <basename>.json,
+For every <basename>.m4a with a matching <basename>.vtt but no <basename>.json,
 strip the timestamps out of the VTT, send the plain text to Ollama's
 /api/generate (JSON mode) and ask for a concise title + multi-paragraph
 description, then write a sidecar <basename>.json that mirrors the shape
 written by scraper.py for downloaded notebooks.
 
-  uv run summarize.py                  # process all MP3s missing a .json
-  uv run summarize.py --file foo.mp3   # process one file
+  uv run summarize.py                  # process all M4As missing a .json
+  uv run summarize.py --file foo.m4a   # process one file
   uv run summarize.py --force          # regenerate even if .json already exists
 
-Designed for MP3s the user manually drops into OUTPUT_DIR. Scraper-downloaded
+Designed for M4As the user manually drops into OUTPUT_DIR. Scraper-downloaded
 episodes already get their .json from scraper.py, so this is a no-op for them.
 
 Configured via OLLAMA_BASE_URL and OLLAMA_TEXT_MODEL in .env.
@@ -288,20 +288,20 @@ def _ollama_summarise(transcript: str) -> tuple[str, str, Optional[str]]:
 # Per-file driver
 # ---------------------------------------------------------------------------
 
-def summarise_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
-    """Generate <basename>.json next to mp3 by summarising <basename>.vtt via
+def summarise_one(m4a: Path, *, force: bool = False) -> Optional[Path]:
+    """Generate <basename>.json next to m4a by summarising <basename>.vtt via
     Ollama. Returns the JSON path, or None if the JSON already exists (and
     force=False) or the VTT is missing. Raises on Ollama / parsing failures."""
-    json_path = mp3.with_suffix(".json")
+    json_path = m4a.with_suffix(".json")
     if json_path.exists() and not force:
-        log.info("Sidecar JSON already exists for %s; skipping.", mp3.name)
+        log.info("Sidecar JSON already exists for %s; skipping.", m4a.name)
         return None
 
-    vtt_path = mp3.with_suffix(".vtt")
+    vtt_path = m4a.with_suffix(".vtt")
     if not vtt_path.exists():
         log.warning(
             "No transcript yet for %s (expected %s); skipping summary.",
-            mp3.name, vtt_path.name,
+            m4a.name, vtt_path.name,
         )
         return None
 
@@ -315,7 +315,7 @@ def summarise_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
     )
     llm_title, description, emoji = _ollama_summarise(transcript)
     if emoji:
-        log.info("Model picked emoji %s for %s.", emoji, mp3.name)
+        log.info("Model picked emoji %s for %s.", emoji, m4a.name)
 
     # Build a title that matches scraper.py's `<prefix> - <topic>` shape so the
     # feed reads consistently. If the LLM already prepended the prefix, don't
@@ -325,19 +325,19 @@ def summarise_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
         stripped = stripped[len(TITLE_PREFIX):].lstrip(" -—:|").strip()
     full_title = f"{TITLE_PREFIX} - {stripped}" if TITLE_PREFIX else stripped
 
-    pub_date = datetime.fromtimestamp(mp3.stat().st_mtime, tz=timezone.utc)
+    pub_date = datetime.fromtimestamp(m4a.stat().st_mtime, tz=timezone.utc)
     metadata = {
         # Stable per-file id (same scheme as the cloud app's synthesised GUID
-        # for bare MP3s) so the feed entry's GUID won't change once we add the
+        # for bare M4As) so the feed entry's GUID won't change once we add the
         # sidecar.
-        "id": hashlib.md5(mp3.name.encode("utf-8")).hexdigest(),
+        "id": hashlib.md5(m4a.name.encode("utf-8")).hexdigest(),
         "title": full_title,
         "description": description,
-        "audio_file": mp3.name,
+        "audio_file": m4a.name,
         "pub_date": pub_date.isoformat(),
         "notebook_id": None,
         "notebook_url": None,
-        # Manually-dropped MP3s have no NotebookLM card to read an icon from,
+        # Manually-dropped M4As have no NotebookLM card to read an icon from,
         # so we ask the summarisation LLM to pick a fitting subject-matter
         # emoji from the transcript. None means the model declined or
         # returned non-emoji text — coverart.py then falls back to
@@ -446,41 +446,41 @@ def backfill_emojis(output_dir: Path) -> int:
 
 
 def summarise_missing(output_dir: Path) -> tuple[int, int]:
-    """Find every *.mp3 in output_dir lacking a matching *.json and generate one
-    from its *.vtt. MP3s without a sibling *.vtt are skipped (run transcribe.py
+    """Find every *.m4a in output_dir lacking a matching *.json and generate one
+    from its *.vtt. M4As without a sibling *.vtt are skipped (run transcribe.py
     first). Returns (successes, failures)."""
     candidates = sorted(
-        mp3 for mp3 in output_dir.glob("*.mp3")
-        if not mp3.with_suffix(".json").exists()
+        m4a for m4a in output_dir.glob("*.m4a")
+        if not m4a.with_suffix(".json").exists()
     )
     if not candidates:
-        log.info("Summary pass: all MP3s already have a .json — nothing to do.")
+        log.info("Summary pass: all M4As already have a .json — nothing to do.")
         return 0, 0
 
-    missing_vtt = [mp3 for mp3 in candidates if not mp3.with_suffix(".vtt").exists()]
+    missing_vtt = [m4a for m4a in candidates if not m4a.with_suffix(".vtt").exists()]
     if missing_vtt:
         log.warning(
-            "Summary pass: %d MP3(s) have no .vtt yet — run transcribe.py first: %s",
+            "Summary pass: %d M4A(s) have no .vtt yet — run transcribe.py first: %s",
             len(missing_vtt),
             ", ".join(m.name for m in missing_vtt),
         )
 
-    actionable = [mp3 for mp3 in candidates if mp3.with_suffix(".vtt").exists()]
+    actionable = [m4a for m4a in candidates if m4a.with_suffix(".vtt").exists()]
     if not actionable:
         return 0, 0
 
     log.info(
-        "Summary pass: %d MP3 file(s) need a JSON sidecar generated from VTT.",
+        "Summary pass: %d M4A file(s) need a JSON sidecar generated from VTT.",
         len(actionable),
     )
     successes, failures = 0, 0
-    for mp3 in actionable:
+    for m4a in actionable:
         try:
-            summarise_one(mp3)
+            summarise_one(m4a)
             successes += 1
         except Exception as e:  # noqa: BLE001
             failures += 1
-            log.error("Failed to summarise %s: %s", mp3.name, e)
+            log.error("Failed to summarise %s: %s", m4a.name, e)
             # Keep going so a single bad file doesn't block the rest.
     log.info("Summary pass done. %d succeeded, %d failed.", successes, failures)
     return successes, failures
@@ -498,7 +498,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--file", type=str, default=None,
-        help="Summarise one specific MP3 file (path) instead of scanning OUTPUT_DIR.",
+        help="Summarise one specific M4A file (path) instead of scanning OUTPUT_DIR.",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -518,30 +518,30 @@ def main() -> int:
         n = backfill_emojis(OUTPUT_DIR)
         if n:
             # Stale covers were deleted in-place; rerender them and re-embed
-            # the new APIC so podcatchers pick up the change.
+            # the new atoms so podcatchers pick up the change.
             from coverart import cover_missing
             cover_missing(OUTPUT_DIR)
             try:
                 from id3tag import tag_missing
                 tag_missing(OUTPUT_DIR)
             except Exception as e:  # noqa: BLE001
-                log.warning("ID3 retag failed: %s", e)
+                log.warning("MP4 retag failed: %s", e)
         return 0
 
     if args.file:
-        mp3 = Path(args.file).expanduser().resolve()
-        if not mp3.exists() or mp3.suffix.lower() != ".mp3":
-            log.error("Not an existing .mp3 file: %s", mp3)
+        m4a = Path(args.file).expanduser().resolve()
+        if not m4a.exists() or m4a.suffix.lower() != ".m4a":
+            log.error("Not an existing .m4a file: %s", m4a)
             return 2
-        summarise_one(mp3, force=args.force)
+        summarise_one(m4a, force=args.force)
     else:
         if args.force:
             # In bulk mode, --force means: regenerate every JSON we could
-            # build (i.e. every MP3 that has a VTT). Delete first so the
+            # build (i.e. every M4A that has a VTT). Delete first so the
             # main loop treats them as missing.
-            for mp3 in OUTPUT_DIR.glob("*.mp3"):
-                if mp3.with_suffix(".vtt").exists():
-                    js = mp3.with_suffix(".json")
+            for m4a in OUTPUT_DIR.glob("*.m4a"):
+                if m4a.with_suffix(".vtt").exists():
+                    js = m4a.with_suffix(".json")
                     if js.exists():
                         js.unlink()
         summarise_missing(OUTPUT_DIR)

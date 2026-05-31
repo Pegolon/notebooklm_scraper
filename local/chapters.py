@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Analyze WebVTT transcripts for MP3 files in OUTPUT_DIR to generate logical
+Analyze WebVTT transcripts for M4A files in OUTPUT_DIR to generate logical
 chapter markers using Ollama, write them as FFmpeg metadata sidecars (.chaptermarks.txt),
-and embed them into the MP3 files using FFmpeg.
+and embed them into the M4A files using FFmpeg.
 
-  uv run chapters.py                  # process all MP3s missing a .chaptermarks.txt
-  uv run chapters.py --file foo.mp3   # process one specific file
+  uv run chapters.py                  # process all M4As missing a .chaptermarks.txt
+  uv run chapters.py --file foo.m4a   # process one specific file
   uv run chapters.py --force          # regenerate chapters even if already present
 
 Requires ffmpeg on PATH.
@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
@@ -265,8 +265,8 @@ def _normalize_chapters(raw_chapters: list[dict], duration_ms: int) -> list[dict
         filtered = [{"title": "Introduction", "start_ms": 0}]
 
     # Filter duplicate start times (keep the first one)
-    unique = []
     seen = set()
+    unique = []
     for c in filtered:
         if c["start_ms"] not in seen:
             unique.append(c)
@@ -314,8 +314,8 @@ def _write_metadata_file(txt_path: Path, title: str, chapters: list[dict]) -> No
 # Pipeline Driver functions
 # ---------------------------------------------------------------------------
 
-def _load_episode_title(mp3_path: Path) -> str:
-    json_path = mp3_path.with_suffix(".json")
+def _load_episode_title(m4a_path: Path) -> str:
+    json_path = m4a_path.with_suffix(".json")
     if json_path.exists():
         try:
             meta = json.loads(json_path.read_text(encoding="utf-8"))
@@ -323,66 +323,67 @@ def _load_episode_title(mp3_path: Path) -> str:
                 return meta["title"]
         except Exception as e:  # noqa: BLE001
             log.warning("Could not parse sidecar JSON for title: %s", e)
-    return mp3_path.stem
+    return m4a_path.stem
 
 
-def _get_mp3_duration_ms(mp3_path: Path) -> int:
+def _get_m4a_duration_ms(m4a_path: Path) -> int:
     try:
-        audio = MP3(str(mp3_path))
+        audio = MP4(str(m4a_path))
         return int(round(audio.info.length * 1000))
     except Exception as e:  # noqa: BLE001
-        log.warning("Could not read MP3 duration via mutagen: %s", e)
+        log.warning("Could not read M4A duration via mutagen: %s", e)
         return 0
 
 
-def _update_mp3_metadata(mp3_path: Path, metadata_path: Path) -> None:
-    """Use FFmpeg to apply the metadata file to the MP3 atomically."""
+def _update_m4a_metadata(m4a_path: Path, metadata_path: Path) -> None:
+    """Use FFmpeg to apply the metadata file to the M4A atomically."""
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found on PATH. Install it (e.g. `brew install ffmpeg`).")
 
-    tmp_mp3 = mp3_path.with_name(f".{mp3_path.name}.partial")
+    tmp_m4a = m4a_path.with_name(f".{m4a_path.name}.partial")
     cmd = [
         "ffmpeg",
         "-y",
         "-loglevel", "error",
-        "-i", str(mp3_path),
+        "-i", str(m4a_path),
         "-i", str(metadata_path),
-        "-map_metadata", "1",
+        "-map", "0:a",
+        "-map_metadata", "0",
         "-map_chapters", "1",
         "-c:a", "copy",
-        "-f", "mp3",
-        str(tmp_mp3)
+        "-f", "ipod",
+        str(tmp_m4a)
     ]
-    log.info("Embedding chapters into %s via FFmpeg...", mp3_path.name)
+    log.info("Embedding chapters into %s via FFmpeg...", m4a_path.name)
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
-        tmp_mp3.unlink(missing_ok=True)
+        tmp_m4a.unlink(missing_ok=True)
         raise RuntimeError(
-            f"ffmpeg failed to apply chapters to {mp3_path.name}: {(e.stderr or '').strip() or e}"
+            f"ffmpeg failed to apply chapters to {m4a_path.name}: {(e.stderr or '').strip() or e}"
         ) from e
     except FileNotFoundError as e:
-        tmp_mp3.unlink(missing_ok=True)
+        tmp_m4a.unlink(missing_ok=True)
         raise RuntimeError("ffmpeg disappeared from PATH.") from e
 
-    tmp_mp3.replace(mp3_path)
+    tmp_m4a.replace(m4a_path)
 
 
-def chapters_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
-    """Generate chapter marks file for an MP3 and update its embedded metadata.
+def chapters_one(m4a: Path, *, force: bool = False) -> Optional[Path]:
+    """Generate chapter marks file for an M4A and update its embedded metadata.
 
     Returns path to the generated chaptermarks file, or None if skipped.
     """
-    txt_path = mp3.with_suffix(".chaptermarks.txt")
+    txt_path = m4a.with_suffix(".chaptermarks.txt")
     if txt_path.exists() and not force:
-        log.info("Chapter marks already exist for %s; skipping.", mp3.name)
+        log.info("Chapter marks already exist for %s; skipping.", m4a.name)
         return None
 
-    vtt_path = mp3.with_suffix(".vtt")
+    vtt_path = m4a.with_suffix(".vtt")
     if not vtt_path.exists():
         log.warning(
             "No transcript yet for %s (expected %s); skipping chapter generation.",
-            mp3.name, vtt_path.name,
+            m4a.name, vtt_path.name,
         )
         return None
 
@@ -398,68 +399,69 @@ def chapters_one(mp3: Path, *, force: bool = False) -> Optional[Path]:
     raw_chapters = _ollama_chapters(timestamped_transcript)
 
     # Determine audio length in milliseconds
-    duration_ms = _get_mp3_duration_ms(mp3)
+    duration_ms = _get_m4a_duration_ms(m4a)
     if duration_ms <= 0:
         duration_ms = _get_last_vtt_timestamp_ms(vtt_path)
     if duration_ms <= 0:
-        raise RuntimeError(f"Could not determine audio duration for {mp3.name}")
+        raise RuntimeError(f"Could not determine audio duration for {m4a.name}")
 
     chapters = _normalize_chapters(raw_chapters, duration_ms)
-    log.info("Generated %d chapter(s) for %s.", len(chapters), mp3.name)
+    log.info("Generated %d chapter(s) for %s.", len(chapters), m4a.name)
 
-    title = _load_episode_title(mp3)
+    title = _load_episode_title(m4a)
     _write_metadata_file(txt_path, title, chapters)
     log.info("Wrote %s.", txt_path.name)
 
-    # Apply to MP3
-    _update_mp3_metadata(mp3, txt_path)
+    # Apply to M4A
+    _update_m4a_metadata(m4a, txt_path)
 
-    # Re-apply standard ID3v2 tags (which FFmpeg's -map_metadata 1 wiped)
-    try:
-        from id3tag import tag_one
-        tag_one(mp3, force=True)
-    except ImportError:
-        log.warning("Could not import id3tag to restore other ID3 frames on %s.", mp3.name)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Failed to restore ID3 tags on %s: %s", mp3.name, e)
+    # Restore metadata tags and cover art if sidecar JSON exists
+    json_path = m4a.with_suffix(".json")
+    if json_path.exists():
+        try:
+            from id3tag import tag_one
+            tag_one(m4a, force=True)
+            log.info("Restored MP4 metadata tags/cover art after chapter embedding.")
+        except Exception as e:
+            log.warning("Could not restore MP4 tags: %s", e)
 
     return txt_path
 
 
 def chapters_missing(output_dir: Path) -> tuple[int, int]:
-    """Find MP3s lacking .chaptermarks.txt and generate chapters for them."""
+    """Find M4As lacking .chaptermarks.txt and generate chapters for them."""
     candidates = sorted(
-        mp3 for mp3 in output_dir.glob("*.mp3")
-        if not mp3.with_suffix(".chaptermarks.txt").exists()
+        m4a for m4a in output_dir.glob("*.m4a")
+        if not m4a.with_suffix(".chaptermarks.txt").exists()
     )
     if not candidates:
-        log.info("Chapters pass: all MP3s already have chapter marks — nothing to do.")
+        log.info("Chapters pass: all M4As already have chapter marks — nothing to do.")
         return 0, 0
 
-    missing_vtt = [mp3 for mp3 in candidates if not mp3.with_suffix(".vtt").exists()]
+    missing_vtt = [m4a for m4a in candidates if not m4a.with_suffix(".vtt").exists()]
     if missing_vtt:
         log.warning(
-            "Chapters pass: %d MP3(s) have no .vtt yet — run transcribe.py first: %s",
+            "Chapters pass: %d M4A(s) have no .vtt yet — run transcribe.py first: %s",
             len(missing_vtt),
             ", ".join(m.name for m in missing_vtt),
         )
 
-    actionable = [mp3 for mp3 in candidates if mp3.with_suffix(".vtt").exists()]
+    actionable = [m4a for m4a in candidates if m4a.with_suffix(".vtt").exists()]
     if not actionable:
         return 0, 0
 
     log.info(
-        "Chapters pass: %d MP3 file(s) need chapter marks generated from VTT.",
+        "Chapters pass: %d M4A file(s) need chapter marks generated from VTT.",
         len(actionable),
     )
     successes, failures = 0, 0
-    for mp3 in actionable:
+    for m4a in actionable:
         try:
-            chapters_one(mp3)
+            chapters_one(m4a)
             successes += 1
         except Exception as e:  # noqa: BLE001
             failures += 1
-            log.error("Failed to generate chapters for %s: %s", mp3.name, e)
+            log.error("Failed to generate chapters for %s: %s", m4a.name, e)
 
     log.info("Chapters pass done. %d succeeded, %d failed.", successes, failures)
     return successes, failures
@@ -477,7 +479,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--file", type=str, default=None,
-        help="Generate chapters for one specific MP3 file (path) instead of scanning OUTPUT_DIR.",
+        help="Generate chapters for one specific M4A file (path) instead of scanning OUTPUT_DIR.",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -489,20 +491,20 @@ def main() -> int:
     assert OUTPUT_DIR is not None
 
     if args.file:
-        mp3 = Path(args.file).expanduser().resolve()
-        if not mp3.exists() or mp3.suffix.lower() != ".mp3":
-            log.error("Not an existing .mp3 file: %s", mp3)
+        m4a = Path(args.file).expanduser().resolve()
+        if not m4a.exists() or m4a.suffix.lower() != ".m4a":
+            log.error("Not an existing .m4a file: %s", m4a)
             return 2
         try:
-            chapters_one(mp3, force=args.force)
+            chapters_one(m4a, force=args.force)
         except Exception as e:  # noqa: BLE001
             log.error("Failed to generate chapters: %s", e)
             return 1
     else:
         if args.force:
-            for mp3 in OUTPUT_DIR.glob("*.mp3"):
-                if mp3.with_suffix(".vtt").exists():
-                    txt = mp3.with_suffix(".chaptermarks.txt")
+            for m4a in OUTPUT_DIR.glob("*.m4a"):
+                if m4a.with_suffix(".vtt").exists():
+                    txt = m4a.with_suffix(".chaptermarks.txt")
                     txt.unlink(missing_ok=True)
         chapters_missing(OUTPUT_DIR)
     return 0

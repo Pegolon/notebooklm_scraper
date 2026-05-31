@@ -830,7 +830,7 @@ def save_episode(
     log.info("Episode hash: %s", ep_hash)
 
     json_path = OUTPUT_DIR / f"{ep_hash}.json"
-    mp3_path = OUTPUT_DIR / f"{ep_hash}.mp3"
+    m4a_path = OUTPUT_DIR / f"{ep_hash}.m4a"
 
     if json_path.exists():
         log.info("Episode already exists (%s); skipping write.", json_path.name)
@@ -839,9 +839,9 @@ def save_episode(
     # Save the raw download to a hidden temp file first — we don't yet know
     # whether NotebookLM delivered real MPEG audio or an MP4/DASH container,
     # and the two need very different post-processing. Sniffing magic bytes
-    # before committing to <hash>.mp3 prevents us from saving a mislabelled
-    # ISO Media stream under a .mp3 extension (which silently breaks every
-    # downstream pass that assumes MPEG audio — id3tag in particular).
+    # before committing to <hash>.m4a prevents us from saving a mislabelled
+    # ISO Media stream under a .m4a extension (which silently breaks every
+    # downstream pass that assumes MP4 audio).
     tmp_download = OUTPUT_DIR / f".{ep_hash}.download.partial"
     download.save_as(str(tmp_download))
 
@@ -855,29 +855,28 @@ def save_episode(
     is_mp4 = head[4:8] == b"ftyp"   # ISO Base Media (MP4, M4A, DASH segments)
 
     if is_mp4:
-        # Hand off to the same ffmpeg helper convert.py uses. We force the
+        # NotebookLM served an MP4 container natively, keep it as-is.
+        log.info("NotebookLM served an MP4 container; saving directly as M4A.")
+        tmp_download.replace(m4a_path)
+    else:
+        # MPEG audio download (b"ID3..." or b"\xff\xfb..."), transcode to M4A
+        # using the same ffmpeg helper convert.py uses. We force the
         # output name so the description-hash naming (and the JSON sidecar
         # that references it) stays valid.
         log.info(
-            "NotebookLM served an MP4/ISO container; transcoding to MP3 "
+            "NotebookLM served raw MPEG audio; transcoding to M4A "
             "in-place via ffmpeg..."
         )
-        from convert import transcode_to_mp3
+        from convert import transcode_to_m4a
 
         try:
-            transcode_to_mp3(tmp_download, mp3_path)
+            transcode_to_m4a(tmp_download, m4a_path)
         finally:
             tmp_download.unlink(missing_ok=True)
-    else:
-        # ID3-tagged MP3 (b"ID3...") or raw MPEG sync (b"\xff\xfb...") — keep
-        # as-is. Any unrecognised header still passes through here; the
-        # size check above ruled out tiny error pages, and downstream
-        # tools (id3tag) will surface real corruption with a clear error.
-        tmp_download.replace(mp3_path)
 
-    size = mp3_path.stat().st_size
+    size = m4a_path.stat().st_size
     if size < 10_000:
-        mp3_path.unlink(missing_ok=True)
+        m4a_path.unlink(missing_ok=True)
         raise RuntimeError(f"Final audio is suspiciously small ({size} bytes); aborting.")
 
     now = datetime.now(timezone.utc)
@@ -886,7 +885,7 @@ def save_episode(
         "id": ep_hash,
         "title": title_part,
         "description": description,
-        "audio_file": f"{ep_hash}.mp3",
+        "audio_file": f"{ep_hash}.m4a",
         "pub_date": now.isoformat(),
         "notebook_id": (notebook or {}).get("id"),
         "notebook_url": (notebook or {}).get("url"),
@@ -901,7 +900,7 @@ def save_episode(
         ),
     }
     json_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("Wrote %s (%.1f KB) and %s", mp3_path.name, size / 1024, json_path.name)
+    log.info("Wrote %s (%.1f KB) and %s", m4a_path.name, size / 1024, json_path.name)
     return json_path, ep_hash
 
 
@@ -1066,16 +1065,16 @@ def run_scrape(url_override: Optional[str]) -> None:
     # Run the post-passes sequentially. Order matters because each later
     # pass depends on artefacts the earlier ones produced for manually-
     # dropped audio (no JSON sidecar from the scraper itself):
-    #   1. convert    : .m4a → <md5(m4a-bytes)>.mp3 (ffmpeg, idempotent)
-    #   2. transcribe : MP3 → .vtt (MLX Whisper, on-device)
+    #   1. convert    : .mp3 → <md5(mp3-bytes)>.m4a (ffmpeg, idempotent)
+    #   2. transcribe : M4A → .vtt (MLX Whisper, on-device)
     #   3. summarise  : .vtt → .json (Ollama text model, only acts when
     #                                 a sidecar JSON is missing)
-    #   4. coverart   : .json + MP3 → .png (Ollama image model)
-    #   5. id3tag     : verify standard podcast ID3 frames on every MP3
+    #   4. coverart   : .json + M4A → .png (Ollama image model)
+    #   5. id3tag     : verify standard podcast MP4 atoms on every M4A
     #                   (uses the JSON sidecar + PNG cover; idempotent —
-    #                   only rewrites frames that are missing or stale)
+    #                   only rewrites atoms that are missing or stale)
     # For scraper-downloaded notebooks passes 1 and 3 are no-ops because
-    # we already have an MP3 + JSON sidecar from save_episode().
+    # we already have an M4A + JSON sidecar from save_episode().
     assert OUTPUT_DIR is not None
     _run_post_passes(OUTPUT_DIR)
 
@@ -1099,7 +1098,7 @@ def _run_post_passes(output_dir: Path) -> None:
     _safe("Summary", summarise_missing, output_dir)
     _safe("Chapter marks", chapters_missing, output_dir)
     _safe("Cover-art", cover_missing, output_dir)
-    _safe("ID3 verification", tag_missing, output_dir)
+    _safe("MP4 metadata verification", tag_missing, output_dir)
 
 
 # ---------------------------------------------------------------------------

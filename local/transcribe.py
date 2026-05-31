@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate WebVTT transcripts for MP3 files in OUTPUT_DIR using MLX Whisper.
+Generate WebVTT transcripts for M4A files in OUTPUT_DIR using MLX Whisper.
 
 Runs entirely on-device via Apple-Silicon-accelerated MLX. For every
-<basename>.mp3 without a matching <basename>.vtt, transcribe the audio with
-`mlx_whisper.transcribe(...)` and save the WebVTT result alongside the MP3.
+<basename>.m4a without a matching <basename>.vtt, transcribe the audio with
+`mlx_whisper.transcribe(...)` and save the WebVTT result alongside the M4A.
 
-  uv run transcribe.py                 # transcribe all MP3s missing a VTT
-  uv run transcribe.py --file foo.mp3  # transcribe a single file
+  uv run transcribe.py                 # transcribe all M4As missing a VTT
+  uv run transcribe.py --file foo.m4a  # transcribe a single file
 
 The default model is mlx-community/whisper-large-v3-mlx; override via
 WHISPER_MODEL in .env. The model is fetched from the Hugging Face Hub on
@@ -95,17 +95,17 @@ def _segments_to_vtt(segments: list[dict]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def transcribe_one(mp3: Path) -> Path:
-    """Run MLX Whisper on mp3, write <basename>.vtt next to it. Returns the
+def transcribe_one(m4a: Path) -> Path:
+    """Run MLX Whisper on m4a, write <basename>.vtt next to it. Returns the
     VTT path. Raises on failure."""
     # Imported lazily so the module loads even without mlx-whisper installed
     # (e.g. when running on a non-Mac host).
     import mlx_whisper
 
-    size_mb = mp3.stat().st_size / 1024 / 1024
+    size_mb = m4a.stat().st_size / 1024 / 1024
     log.info(
         "Transcribing %s (%.1f MB) via %s%s...",
-        mp3.name,
+        m4a.name,
         size_mb,
         WHISPER_MODEL,
         f" (lang={WHISPER_LANGUAGE})" if WHISPER_LANGUAGE else " (auto-detect)",
@@ -122,7 +122,7 @@ def transcribe_one(mp3: Path) -> Path:
     if WHISPER_INITIAL_PROMPT:
         kwargs["initial_prompt"] = WHISPER_INITIAL_PROMPT
 
-    result = mlx_whisper.transcribe(str(mp3), **kwargs)
+    result = mlx_whisper.transcribe(str(m4a), **kwargs)
     segments = result.get("segments") or []
     if not segments:
         # Fall back to a single cue spanning the whole text if the model
@@ -133,7 +133,7 @@ def transcribe_one(mp3: Path) -> Path:
         segments = [{"start": 0.0, "end": 0.0, "text": text}]
 
     vtt_text = _segments_to_vtt(segments)
-    vtt_path = mp3.with_suffix(".vtt")
+    vtt_path = m4a.with_suffix(".vtt")
     vtt_path.write_text(vtt_text, encoding="utf-8")
     log.info(
         "Wrote %s (%d bytes, %d cues).",
@@ -145,25 +145,25 @@ def transcribe_one(mp3: Path) -> Path:
 
 
 def transcribe_missing(output_dir: Path) -> tuple[int, int]:
-    """Find every *.mp3 in output_dir lacking a matching *.vtt and transcribe each.
+    """Find every *.m4a in output_dir lacking a matching *.vtt and transcribe each.
     Returns (successes, failures)."""
     missing = sorted(
-        mp3 for mp3 in output_dir.glob("*.mp3")
-        if not mp3.with_suffix(".vtt").exists()
+        m4a for m4a in output_dir.glob("*.m4a")
+        if not m4a.with_suffix(".vtt").exists()
     )
     if not missing:
-        log.info("Transcription pass: all MP3s already have a .vtt — nothing to do.")
+        log.info("Transcription pass: all M4As already have a .vtt — nothing to do.")
         return 0, 0
 
-    log.info("Transcription pass: %d MP3 file(s) missing a transcript.", len(missing))
+    log.info("Transcription pass: %d M4A file(s) missing a transcript.", len(missing))
     successes, failures = 0, 0
-    for mp3 in missing:
+    for m4a in missing:
         try:
-            transcribe_one(mp3)
+            transcribe_one(m4a)
             successes += 1
         except Exception as e:  # noqa: BLE001
             failures += 1
-            log.error("Failed to transcribe %s: %s", mp3.name, e)
+            log.error("Failed to transcribe %s: %s", m4a.name, e)
             # Keep going so a single bad file doesn't block the rest.
     log.info("Transcription pass done. %d succeeded, %d failed.", successes, failures)
     return successes, failures
@@ -179,7 +179,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--file", type=str, default=None,
-        help="Transcribe one specific MP3 file (path) instead of scanning OUTPUT_DIR.",
+        help="Transcribe one specific M4A file (path) instead of scanning OUTPUT_DIR.",
     )
     args = parser.parse_args()
 
@@ -187,11 +187,11 @@ def main() -> int:
     assert OUTPUT_DIR is not None
 
     if args.file:
-        mp3 = Path(args.file).expanduser().resolve()
-        if not mp3.exists() or mp3.suffix.lower() != ".mp3":
-            log.error("Not an existing .mp3 file: %s", mp3)
+        m4a = Path(args.file).expanduser().resolve()
+        if not m4a.exists() or m4a.suffix.lower() != ".m4a":
+            log.error("Not an existing .m4a file: %s", m4a)
             return 2
-        transcribe_one(mp3)
+        transcribe_one(m4a)
     else:
         transcribe_missing(OUTPUT_DIR)
     return 0
