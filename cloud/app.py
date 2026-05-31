@@ -34,8 +34,10 @@ import time
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import AsyncIterable, Iterable, Optional
 from xml.etree import ElementTree as ET
+
+import anyio
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -247,16 +249,16 @@ def build_feed(episodes: list[dict], base_url: str) -> str:
 # ---------------------------------------------------------------------------
 
 _RANGE_RE = re.compile(r"^\s*bytes=(\d*)-(\d*)\s*$")
-_AUDIO_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+_AUDIO_CHUNK_SIZE = 64 * 1024  # 64 KiB
 
 
-def _iter_file(path: Path, start: int, end: int) -> Iterable[bytes]:
+async def _iter_file(path: Path, start: int, end: int) -> AsyncIterable[bytes]:
     """Yield bytes from path in [start, end] inclusive, in chunks."""
     remaining = end - start + 1
-    with open(path, "rb") as f:
-        f.seek(start)
+    async with await anyio.open_file(path, "rb") as f:
+        await f.seek(start)
         while remaining > 0:
-            data = f.read(min(_AUDIO_CHUNK_SIZE, remaining))
+            data = await f.read(min(_AUDIO_CHUNK_SIZE, remaining))
             if not data:
                 break
             remaining -= len(data)
@@ -443,7 +445,7 @@ def serve_feed(request: Request) -> Response:
 
 
 @app.api_route("/audio/{filename}", methods=["GET", "HEAD"])
-def serve_audio(filename: str, request: Request) -> Response:
+async def serve_audio(filename: str, request: Request) -> Response:
     """Stream an M4A from OUTPUT_DIR with HTTP Range support.
 
     Range support is required by Apple Podcasts and most podcast clients to
