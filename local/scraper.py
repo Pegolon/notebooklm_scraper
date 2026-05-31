@@ -1080,25 +1080,92 @@ def run_scrape(url_override: Optional[str]) -> None:
 
 
 def _run_post_passes(output_dir: Path) -> None:
-    from convert import convert_missing
-    from transcribe import transcribe_missing
-    from summarize import summarise_missing
-    from chapters import chapters_missing
-    from coverart import cover_missing
-    from id3tag import tag_missing
+    from convert import convert_one, _hash_file
+    from transcribe import transcribe_one
+    from summarize import summarise_one
+    from chapters import chapters_one
+    from coverart import generate_one
+    from id3tag import tag_one
 
-    def _safe(name: str, fn, *args) -> None:
-        try:
-            fn(*args)
-        except Exception as e:  # noqa: BLE001
-            log.warning("%s pass failed: %s", name, e)
+    # 1. Identify all MP3 files
+    mp3s = sorted(
+        p for p in output_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".mp3"
+    )
 
-    _safe("M4A conversion", convert_missing, output_dir)
-    _safe("Transcription", transcribe_missing, output_dir)
-    _safe("Summary", summarise_missing, output_dir)
-    _safe("Chapter marks", chapters_missing, output_dir)
-    _safe("Cover-art", cover_missing, output_dir)
-    _safe("MP4 metadata verification", tag_missing, output_dir)
+    # We keep track of target M4As we process from MP3s to avoid double-processing them
+    processed_m4as = set()
+
+    # Helper to run the downstream pipeline for a single M4A file
+    def process_m4a_file(m4a_path: Path) -> None:
+        # A helper for safe execution of a stage for a single file
+        def _safe_stage(stage_name: str, fn, *args, **kwargs) -> bool:
+            try:
+                fn(*args, **kwargs)
+                return True
+            except Exception as e:  # noqa: BLE001
+                log.warning("File %s: %s stage failed: %s", m4a_path.name, stage_name, e)
+                return False
+
+        # Transcribe (only if VTT is missing)
+        vtt_path = m4a_path.with_suffix(".vtt")
+        if not vtt_path.exists():
+            _safe_stage("Transcription", transcribe_one, m4a_path)
+
+        # Summarize (only if JSON is missing)
+        json_path = m4a_path.with_suffix(".json")
+        if not json_path.exists():
+            _safe_stage("Summary", summarise_one, m4a_path)
+
+        # Chapters (only if chaptermarks missing)
+        txt_path = m4a_path.with_suffix(".chaptermarks.txt")
+        if not txt_path.exists():
+            _safe_stage("Chapter marks", chapters_one, m4a_path)
+
+        # Cover-art (only if PNG is missing)
+        png_path = m4a_path.with_suffix(".png")
+        if not png_path.exists():
+            _safe_stage("Cover-art", generate_one, m4a_path)
+
+        # MP4 metadata tagging (always runs to verify/repair, only rewrites if stale/missing)
+        _safe_stage("MP4 metadata verification", tag_one, m4a_path)
+
+    # First, process any MP3s
+    if mp3s:
+        log.info("Per-file pipeline: found %d .mp3 file(s) for conversion.", len(mp3s))
+        for mp3 in mp3s:
+            try:
+                # Get the target M4A hash/filename first
+                digest = _hash_file(mp3)
+                m4a_path = output_dir / f"{digest}.m4a"
+                processed_m4as.add(m4a_path)
+
+                # Convert
+                if not m4a_path.exists():
+                    log.info("Per-file pipeline: converting %s to %s", mp3.name, m4a_path.name)
+                    convert_one(mp3, output_dir=output_dir)
+                else:
+                    log.info("Per-file pipeline: %s already converted to %s", mp3.name, m4a_path.name)
+
+                # Then run downstream pipeline for this M4A
+                process_m4a_file(m4a_path)
+            except Exception as e:  # noqa: BLE001
+                log.error("Failed to process MP3 file %s: %s", mp3.name, e)
+
+    # Next, process any other M4A files in the output directory
+    m4as = sorted(
+        p for p in output_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".m4a"
+    )
+    m4as_to_process = [m for m in m4as if m not in processed_m4as]
+
+    if m4as_to_process:
+        log.info("Per-file pipeline: found %d existing .m4a file(s) to process.", len(m4as_to_process))
+        for m4a in m4as_to_process:
+            try:
+                process_m4a_file(m4a)
+            except Exception as e:  # noqa: BLE001
+                log.error("Failed to process M4A file %s: %s", m4a.name, e)
 
 
 # ---------------------------------------------------------------------------
