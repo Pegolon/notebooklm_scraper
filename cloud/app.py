@@ -24,11 +24,13 @@ Run:
 
 from __future__ import annotations
 
+from collections import defaultdict
 import hashlib
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -278,6 +280,84 @@ def _safe_resolve(name: str, suffix: str) -> Path:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="NotebookLM Podcast", docs_url=None, redoc_url=None)
+
+
+# Dynamic IP blocking configuration
+BANNED_IPS: dict[str, float] = {}  # client_ip -> ban_expires_timestamp
+BAD_REQUESTS: dict[str, list[float]] = defaultdict(list)  # client_ip -> list of timestamps
+
+BAN_DURATION = 86400  # Ban for 24 hours
+MAX_BAD_REQUESTS = 3   # Ban after 3 attempts
+WINDOW_SECONDS = 300   # 5-minute tracking window
+
+# Patterns indicating malicious vulnerability scanning
+SCAN_PATTERNS = [
+    re.compile(r"\.env", re.IGNORECASE),
+    re.compile(r"\.git", re.IGNORECASE),
+    re.compile(r"\.php", re.IGNORECASE),
+    re.compile(r"wp-", re.IGNORECASE),
+    re.compile(r"config", re.IGNORECASE),
+    re.compile(r"phpinfo", re.IGNORECASE),
+    re.compile(r"xmlrpc", re.IGNORECASE),
+    re.compile(r"backup", re.IGNORECASE),
+]
+
+
+def get_client_ip(request: Request) -> str:
+    """Extract client IP, respecting proxy headers if present."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
+def is_legitimate_route(path: str) -> bool:
+    """Check if the path matches one of our defined endpoints to prevent false positives."""
+    if path in ("/", "/feed.xml"):
+        return True
+    for prefix in ("/audio/", "/images/", "/transcripts/"):
+        if path.startswith(prefix):
+            return True
+    return False
+
+
+@app.middleware("http")
+async def block_scanners_middleware(request: Request, call_next):
+    client_ip = get_client_ip(request)
+    now = time.time()
+
+    # 1. Check if IP is currently banned
+    if client_ip in BANNED_IPS:
+        if now < BANNED_IPS[client_ip]:
+            # Silent 403 response for banned IPs
+            return Response(status_code=403, content="Forbidden")
+        else:
+            # Ban expired
+            del BANNED_IPS[client_ip]
+
+    # 2. Inspect non-legitimate routes for malicious scanning patterns
+    path = request.url.path
+    if not is_legitimate_route(path):
+        is_scan = any(pattern.search(path) for pattern in SCAN_PATTERNS)
+        if is_scan:
+            log.warning("Malicious scan detected: IP %s -> PATH %s", client_ip, path)
+
+            # Record bad request
+            BAD_REQUESTS[client_ip].append(now)
+            # Prune expired records
+            BAD_REQUESTS[client_ip] = [t for t in BAD_REQUESTS[client_ip] if now - t <= WINDOW_SECONDS]
+
+            # Ban if threshold exceeded
+            if len(BAD_REQUESTS[client_ip]) >= MAX_BAD_REQUESTS:
+                BANNED_IPS[client_ip] = now + BAN_DURATION
+                log.error("IP %s has been banned for 24h due to excessive scans. Last path: %s", client_ip, path)
+
+            return Response(status_code=404, content="Not Found")
+
+    return await call_next(request)
 
 
 @app.on_event("startup")
