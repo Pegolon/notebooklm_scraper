@@ -37,9 +37,12 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import signal
 import sys
 from pathlib import Path
+
+TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s")
 
 ROOT = Path(__file__).resolve().parent
 LOCAL_DIR = ROOT / "local"
@@ -70,9 +73,12 @@ async def _pipe_to_log(stream: asyncio.StreamReader | None, prefix: str) -> None
         # Generate timestamp matching orchestrator formatting
         now = datetime.datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        # Decode and strip local-side timestamp if present to avoid double timestamps
+        decoded_line = line.decode(errors='replace')
+        decoded_line = TIMESTAMP_RE.sub("", decoded_line, count=1)
         # Children already format their own log lines; prepend the timestamp and tag them
         # so the combined stream is readable.
-        sys.stdout.write(f"{timestamp} [{prefix}] {line.decode(errors='replace')}")
+        sys.stdout.write(f"{timestamp} [{prefix}] {decoded_line}")
         sys.stdout.flush()
 
 
