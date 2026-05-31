@@ -6,7 +6,7 @@ new Audio Overviews from NotebookLM into the Google-Drive-synced
 per-episode cover image showing the notebook's auto-assigned emoji on a
 gradient circle (pure Pillow — no AI, no network).
 
-Every `scraper.py` run does all five passes in sequence; each one is also
+Every `scraper.py` run does all six passes in sequence; each one is also
 runnable standalone for backfills.
 
 ```bash
@@ -19,6 +19,8 @@ uv run scraper.py --list               # debug: list visible notebooks (with emo
 uv run scraper.py --url <NOTEBOOK_URL> # force a specific notebook
 uv run transcribe.py                   # transcribe any MP3 missing a .vtt
 uv run transcribe.py --file foo.mp3    # transcribe one file
+uv run chapters.py                     # generate chapter marks for any MP3 missing .chaptermarks.txt
+uv run chapters.py --file foo.mp3      # generate chapter marks for one file
 uv run coverart.py                     # render cover PNGs for any MP3 missing one
 uv run coverart.py --file foo.mp3      # render one cover
 uv run coverart.py --force             # regenerate every cover

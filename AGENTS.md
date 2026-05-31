@@ -48,6 +48,7 @@ and `README.md`. Never merge them — they ship to different hosts.
 | [local/transcribe.py](local/transcribe.py) | MLX Whisper → WebVTT (on-device). Scans for MP3s missing `.vtt`. Standalone CLI + importable `transcribe_missing()`. |
 | [local/summarize.py](local/summarize.py) | Ollama text model → `<basename>.json`. Scans for MP3s missing `.json` but having `.vtt`; strips VTT cue headers, asks Ollama (JSON mode) for `{title, description, emoji}`, validates the emoji (rejects shortcodes / words via `_extract_emoji()`), writes a sidecar mirroring scraper.py's shape (`source: "manual"`, `notebook_emoji` populated from the LLM). Also exposes `--backfill-emojis` (cheap emoji-only LLM call for existing manual sidecars). Standalone CLI + importable `summarise_missing()` / `backfill_emojis()`. |
 | [local/coverart.py](local/coverart.py) | Pillow → `<hash>.png` (1400×1400). Reads the `notebook_emoji` field scraper.py captured from NotebookLM's auto-assigned icon and renders it full-bleed on a per-episode gradient circle. No AI, no network. Scans for MP3s missing `.png`. Standalone CLI + importable `cover_missing()`. |
+| [local/chapters.py](local/chapters.py) | Ollama → `<basename>.chaptermarks.txt`. Scans for MP3s missing chapter marks; asks Ollama to group transcript chunks into cohesive chapters, writes FFmpeg metadata, embeds them via FFmpeg, and restores ID3 tags. Standalone CLI + importable `chapters_missing()`. |
 | [local/pyproject.toml](local/pyproject.toml) | Deps: `playwright`, `python-dotenv`, `mlx-whisper`, `pillow`, `mutagen`, `google-genai`. |
 | [local/.env.example](local/.env.example) | Local-side config template. |
 | [cloud/app.py](cloud/app.py) | FastAPI app: `GET /feed.xml` + `GET /audio/{name}` (range-aware) + `GET /transcripts/{name}` + `GET /images/{name}`. Reads files directly from `OUTPUT_DIR`. |
@@ -77,6 +78,9 @@ uv run summarize.py --backfill-emojis  # ask LLM for an emoji for existing sidec
 uv run coverart.py                     # generate cover PNGs for any MP3 missing one
 uv run coverart.py --file foo.mp3      # generate one cover
 uv run coverart.py --force             # regenerate everything
+uv run chapters.py                     # generate chapter marks for any MP3 missing one
+uv run chapters.py --file foo.mp3      # generate chapters for one file
+uv run chapters.py --force             # regenerate chapters even if they exist
 
 # cloud side
 cd cloud
@@ -452,7 +456,7 @@ summary, the Studio panel label set.
 
 ```bash
 # Sanity-check Python compiles after edits
-uv --project local run python -m py_compile local/scraper.py local/convert.py local/transcribe.py local/summarize.py local/coverart.py
+uv --project local run python -m py_compile local/scraper.py local/convert.py local/transcribe.py local/summarize.py local/chapters.py local/coverart.py local/id3tag.py
 uv --project cloud run python -m py_compile cloud/app.py
 
 # Confirm the Ollama host is reachable and the image model is installed

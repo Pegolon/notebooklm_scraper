@@ -1084,6 +1084,7 @@ def _run_post_passes(output_dir: Path) -> None:
     from convert import convert_missing
     from transcribe import transcribe_missing
     from summarize import summarise_missing
+    from chapters import chapters_missing
     from coverart import cover_missing
     from id3tag import tag_missing
 
@@ -1096,6 +1097,7 @@ def _run_post_passes(output_dir: Path) -> None:
     _safe("M4A conversion", convert_missing, output_dir)
     _safe("Transcription", transcribe_missing, output_dir)
     _safe("Summary", summarise_missing, output_dir)
+    _safe("Chapter marks", chapters_missing, output_dir)
     _safe("Cover-art", cover_missing, output_dir)
     _safe("ID3 verification", tag_missing, output_dir)
 
